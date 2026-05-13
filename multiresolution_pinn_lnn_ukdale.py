@@ -94,12 +94,9 @@ SLOW_DILATIONS = [1, 16, 64]
 
 APPLIANCES = ['dishwasher', 'fridge', 'microwave', 'washing_machine']
 
-THRESHOLDS = {
-    'dishwasher':      10.0,
-    'fridge':          10.0,
-    'microwave':       10.0,
-    'washing_machine': 10.0,
-}
+THRESHOLD_DELTA  = 20.0   # W above standby baseline = definitely ON
+THRESHOLD_LOW_PCT = 0.05  # low percentile of nonzero readings = standby estimate
+THRESHOLD_MIN    = 10.0   # floor so we never go below 10 W
 
 POS_WEIGHT_CLAMP = (1.0, 50.0)   # clamp range for per-appliance pos_weight
 
@@ -158,6 +155,29 @@ def compute_features(df: pd.DataFrame) -> np.ndarray:
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
+
+def compute_adaptive_thresholds(df: pd.DataFrame) -> dict:
+    """
+    Per-appliance ON/OFF threshold calibrated from this split's own data.
+
+    Standby estimate = low_pct percentile of nonzero readings.
+    Threshold = standby + THRESHOLD_DELTA (W above idle = definitely active).
+
+    Handles House 5 where microwave and washing machine never go fully to 0 W
+    (persistent standby draw ~14-25 W) — a fixed 10 W threshold would label
+    them as always-ON, collapsing precision to near zero on the test set.
+    """
+    thresholds = {}
+    for app in APPLIANCES:
+        col     = df[app]
+        nonzero = col[col > 0]
+        if len(nonzero) == 0:
+            thresholds[app] = THRESHOLD_MIN
+        else:
+            standby        = float(nonzero.quantile(THRESHOLD_LOW_PCT))
+            thresholds[app] = max(standby + THRESHOLD_DELTA, THRESHOLD_MIN)
+    return thresholds
+
 
 def load_csv(split: str) -> pd.DataFrame:
     path = os.path.join(DATA_DIR, f'UKDALE_HF_{split}.csv')
@@ -467,12 +487,12 @@ def reconstruct_trace(window_preds: list, n_total: int,
 # ---------------------------------------------------------------------------
 
 def per_app_metrics(y_true: np.ndarray, y_pred: np.ndarray,
-                    y_scalers: list) -> dict:
+                    y_scalers: list, thresholds: dict) -> dict:
     out = {}
     for i, app in enumerate(APPLIANCES):
         raw_t = y_scalers[i].inverse_transform(y_true[:, i:i+1]).flatten()
         raw_p = y_scalers[i].inverse_transform(y_pred[:, i:i+1]).flatten()
-        out[app] = calculate_nilm_metrics(raw_t, raw_p, threshold=THRESHOLDS[app])
+        out[app] = calculate_nilm_metrics(raw_t, raw_p, threshold=thresholds[app])
     return out
 
 
@@ -504,7 +524,17 @@ def train(save_dir:      str,
     df_te = load_csv('test')
     n_tr, n_va, n_te = len(df_tr), len(df_va), len(df_te)
 
-    print("Computing features (median + EMA + delta + rolling stats) ...")
+    # ── Adaptive per-split thresholds ─────────────────────────────────────────
+    tr_thresholds = compute_adaptive_thresholds(df_tr)
+    va_thresholds = compute_adaptive_thresholds(df_va)
+    te_thresholds = compute_adaptive_thresholds(df_te)
+    print("\n  Adaptive ON/OFF thresholds (W):")
+    print(f"  {'Appliance':<22} {'Train':>8} {'Val':>8} {'Test':>8}")
+    for app in APPLIANCES:
+        print(f"  {app:<22} {tr_thresholds[app]:>8.1f} "
+              f"{va_thresholds[app]:>8.1f} {te_thresholds[app]:>8.1f}")
+
+    print("\nComputing features (median + EMA + delta + rolling stats) ...")
     feat_tr = compute_features(df_tr)
     feat_va = compute_features(df_va)
     feat_te = compute_features(df_te)
@@ -552,8 +582,9 @@ def train(save_dir:      str,
             Y_te[:, :, i].reshape(-1, 1)).reshape(-1, WIN)
         y_scalers.append(ys)
 
+    # Scaled thresholds for event BCE — use training-split values (House 1)
     thresholds_scaled = [
-        (THRESHOLDS[app] - float(y_scalers[i].data_min_[0]))
+        (tr_thresholds[app] - float(y_scalers[i].data_min_[0]))
         / float(y_scalers[i].data_range_[0])
         for i, app in enumerate(APPLIANCES)
     ]
@@ -694,7 +725,7 @@ def train(save_dir:      str,
 
         pred_trace = reconstruct_trace(va_preds, n_va, STRIDE, WIN)
         true_trace = reconstruct_trace(va_trues, n_va, STRIDE, WIN)
-        vm         = per_app_metrics(true_trace, pred_trace, y_scalers)
+        vm         = per_app_metrics(true_trace, pred_trace, y_scalers, va_thresholds)
         history['val_metrics'].append(vm)
 
         avg_f1  = np.mean([vm[a]['f1']  for a in APPLIANCES])
@@ -744,7 +775,7 @@ def train(save_dir:      str,
 
     pred_trace_te = reconstruct_trace(te_preds, n_te, WIN, WIN)
     true_trace_te = reconstruct_trace(te_trues, n_te, WIN, WIN)
-    test_metrics  = per_app_metrics(true_trace_te, pred_trace_te, y_scalers)
+    test_metrics  = per_app_metrics(true_trace_te, pred_trace_te, y_scalers, te_thresholds)
 
     print(f"\n{'Appliance':<24} {'F1':>8} {'Precision':>10} "
           f"{'Recall':>8} {'MAE':>8} {'SAE':>8}")
@@ -786,6 +817,11 @@ def train(save_dir:      str,
             'lambda_event':  lambda_event,
         },
         'pos_weights': {app: float(pw) for app, pw in zip(APPLIANCES, pos_weights)},
+        'thresholds': {
+            'train': tr_thresholds,
+            'val':   va_thresholds,
+            'test':  te_thresholds,
+        },
         'preprocessing': {
             'denoising': [
                 f'Median filter: window={MEDFILT_K} steps ({MEDFILT_K*6}s)',
