@@ -1,0 +1,27 @@
+# Raw UKDALE sensor data (too large for git)
+ukdale/**/*.dat
+ukdale/*.h5
+ukdale/*.csv
+
+# Model checkpoints and output artifacts
+models/
+
+# IDE / tool settings
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.env
+.venv
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
