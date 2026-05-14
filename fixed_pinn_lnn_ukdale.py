@@ -73,6 +73,7 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 from tqdm import tqdm
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.cluster import KMeans
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'Source Code'))
 from utils import calculate_nilm_metrics
@@ -102,10 +103,12 @@ WARMUP_EPOCHS = 20
 THRESHOLD_DELTA   = 20.0   # W above standby = definitely ON
 THRESHOLD_LOW_PCT = 0.05   # p5 of nonzero readings = standby estimate
 THRESHOLD_MIN     = 10.0   # floor (W)
-# Bimodal fix: if p10(nonzero) > this, the appliance has no low-power standby
-# (cycling device like fridge: 0W OFF, 100W+ ON).  Use THRESHOLD_MIN so the
-# threshold sits well below the operating cluster instead of inside it.
-STANDBY_CAP_W     = 50.0
+# Bimodal fix: 2-means on nonzero readings.  If the high cluster center is
+# more than BIMODAL_RATIO x the low cluster center, the appliance has a true
+# standby+operating separation → use p5+delta.  Otherwise it is a cycling
+# appliance (fridge: 0W↔110W, single cluster) → use THRESHOLD_MIN.
+BIMODAL_RATIO     = 3.0   # high_center > low_center * (1 + ratio) → bimodal
+KMEANS_MIN_N      = 50    # fall back to p5+delta if fewer nonzero samples
 
 POS_WEIGHT_CLAMP = (1.0, 50.0)
 
@@ -122,18 +125,24 @@ DATA_DIR = os.path.join(os.path.dirname(__file__), 'dataset')
 
 def compute_adaptive_thresholds(df: pd.DataFrame) -> dict:
     """
-    Bimodal-aware adaptive threshold per appliance.
+    2-means bimodal-aware adaptive threshold per appliance.
 
-    Two appliance regimes exist in UKDALE:
+    Fit KMeans(k=2) on nonzero readings.  Sort cluster centers low/high.
+    If high_center > low_center * (1 + BIMODAL_RATIO), the distribution is
+    bimodal (standby cluster + operating cluster) → threshold = p5 + delta
+    sits between them.
 
-      Standby appliances (microwave H5: 25W idle, 800W cooking):
-        p10(nonzero) is LOW → threshold = p5(nonzero) + THRESHOLD_DELTA
-        sits between the standby and operating clusters.
+    If the two centers are close (unimodal), the appliance cycles between
+    exactly 0W and one operating level (fridge) — any nonzero draw is ON →
+    threshold = THRESHOLD_MIN.
 
-      Cycling appliances (fridge: 0W OFF, 100W+ ON, nothing in between):
-        p10(nonzero) is HIGH (>STANDBY_CAP_W) → the p5+delta formula would
-        place the threshold *inside* the operating cluster, classifying most
-        ON-readings as OFF.  Use THRESHOLD_MIN instead (any nonzero draw is ON).
+    Examples:
+      Fridge H5  : nonzero all ~106-200W → centers [120W, 165W]
+                   165 < 120*(1+3)=480 → unimodal → 10W ✓
+      Dishwasher H5: nonzero 57W phases + 1500W cycle
+                   centers ≈ [70W, 1400W], 1400 > 70*4=280 → bimodal → 77W ✓
+      Microwave H5 : standby 25W + cooking 800W+
+                   centers ≈ [25W, 820W], 820 > 25*4=100 → bimodal → 68W ✓
     """
     thresholds = {}
     for app in APPLIANCES:
@@ -142,14 +151,22 @@ def compute_adaptive_thresholds(df: pd.DataFrame) -> dict:
         if len(nonzero) == 0:
             thresholds[app] = THRESHOLD_MIN
             continue
-        p10 = float(np.percentile(nonzero, 10))
-        if p10 > STANDBY_CAP_W:
-            # Cycling appliance: no standby draw — ON = any nonzero reading
-            thresholds[app] = THRESHOLD_MIN
+
+        p5 = float(np.percentile(nonzero, 5))
+
+        if len(nonzero) >= KMEANS_MIN_N:
+            km  = KMeans(n_clusters=2, n_init=10, random_state=42)
+            km.fit(nonzero.reshape(-1, 1))
+            low, high = sorted(km.cluster_centers_.flatten())
+            bimodal = high > low * (1.0 + BIMODAL_RATIO)
         else:
-            # Standby appliance: threshold above the standby cluster
-            p5 = float(np.percentile(nonzero, 5))
+            bimodal = True  # too few samples to cluster; trust p5+delta
+
+        if bimodal:
             thresholds[app] = max(p5 + THRESHOLD_DELTA, THRESHOLD_MIN)
+        else:
+            # Unimodal cycling appliance: ON = any nonzero draw
+            thresholds[app] = THRESHOLD_MIN
     return thresholds
 
 
