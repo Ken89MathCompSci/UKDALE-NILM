@@ -66,7 +66,6 @@ import os
 import json
 import numpy as np
 import pandas as pd
-import pickle
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -106,10 +105,11 @@ THRESHOLD_MIN     = 10.0   # floor (W)
 
 POS_WEIGHT_CLAMP = (1.0, 50.0)
 
-# appliance names match the pkl column names
-APPLIANCES = ['dish washer', 'fridge', 'microwave', 'washer dryer']
+# appliance names match the CSV column names
+APPLIANCES  = ['dishwasher', 'fridge', 'microwave', 'washing_machine']
+AGG_COL     = 'aggregate'
 
-DATA_DIR = os.path.join(os.path.dirname(__file__), 'data', 'ukdale')
+DATA_DIR = os.path.join(os.path.dirname(__file__), 'dataset')
 
 
 # ---------------------------------------------------------------------------
@@ -193,12 +193,16 @@ def compute_features(mains: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 def load_data() -> dict:
-    print("Loading UKDALE pkl data ...")
+    print("Loading UKDALE CSV data ...")
+    file_map = {
+        'train': 'UKDALE_HF_train.csv',
+        'val':   'UKDALE_HF_validation.csv',
+        'test':  'UKDALE_HF_test.csv',
+    }
     splits = {}
-    for split in ['train_small', 'val_small', 'test_small']:
-        path = os.path.join(DATA_DIR, f'{split}.pkl')
-        with open(path, 'rb') as f:
-            splits[split.replace('_small', '')] = pickle.load(f)[0]
+    for name, fname in file_map.items():
+        path = os.path.join(DATA_DIR, fname)
+        splits[name] = pd.read_csv(path, index_col='timestamp', parse_dates=True)
     for name, df in splits.items():
         print(f"  {name:6s}: {len(df):6d} rows  "
               f"{df.index.min().date()} -> {df.index.max().date()}")
@@ -213,7 +217,7 @@ def create_sequences(df: pd.DataFrame, thresholds: dict, stride: int):
         X   (M, WIN, 8)         — multi-channel feature windows
         Y   (M, WIN, n_apps)    — appliance values at every timestep  [FIX 2]
     """
-    feat = compute_features(df['main'].values)
+    feat = compute_features(df[AGG_COL].values)
     app_arrs = {app: df[app].values.astype(np.float32) for app in APPLIANCES}
     N = len(feat)
 
@@ -692,7 +696,7 @@ def train(data_dict: dict, save_dir: str,
     _plot_metrics(history, test_metrics, save_dir)
 
     cfg = {
-        'dataset': 'UKDALE (pkl splits)',
+        'dataset': 'UKDALE (CSV splits)',
         'model':   'FixedPINNLNN',
         'fixes_applied': [
             'FIX1: sigmoid on power heads',
@@ -780,7 +784,7 @@ def _plot_metrics(history: dict, test_metrics: dict, save_dir: str) -> None:
 # ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
-    for f in ['train_small.pkl', 'val_small.pkl', 'test_small.pkl']:
+    for f in ['UKDALE_HF_train.csv', 'UKDALE_HF_validation.csv', 'UKDALE_HF_test.csv']:
         p = os.path.join(DATA_DIR, f)
         if not os.path.exists(p):
             print(f"Error: {p} not found.")
