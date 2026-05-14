@@ -102,6 +102,10 @@ WARMUP_EPOCHS = 20
 THRESHOLD_DELTA   = 20.0   # W above standby = definitely ON
 THRESHOLD_LOW_PCT = 0.05   # p5 of nonzero readings = standby estimate
 THRESHOLD_MIN     = 10.0   # floor (W)
+# Bimodal fix: if p10(nonzero) > this, the appliance has no low-power standby
+# (cycling device like fridge: 0W OFF, 100W+ ON).  Use THRESHOLD_MIN so the
+# threshold sits well below the operating cluster instead of inside it.
+STANDBY_CAP_W     = 50.0
 
 POS_WEIGHT_CLAMP = (1.0, 50.0)
 
@@ -118,20 +122,34 @@ DATA_DIR = os.path.join(os.path.dirname(__file__), 'dataset')
 
 def compute_adaptive_thresholds(df: pd.DataFrame) -> dict:
     """
-    Standby = p5 of nonzero readings per appliance.
-    Threshold = standby + THRESHOLD_DELTA, floored at THRESHOLD_MIN.
-    Handles persistent standby draws that make a fixed 10 W threshold
-    classify appliances as always-ON (e.g., House 5 microwave, WM).
+    Bimodal-aware adaptive threshold per appliance.
+
+    Two appliance regimes exist in UKDALE:
+
+      Standby appliances (microwave H5: 25W idle, 800W cooking):
+        p10(nonzero) is LOW → threshold = p5(nonzero) + THRESHOLD_DELTA
+        sits between the standby and operating clusters.
+
+      Cycling appliances (fridge: 0W OFF, 100W+ ON, nothing in between):
+        p10(nonzero) is HIGH (>STANDBY_CAP_W) → the p5+delta formula would
+        place the threshold *inside* the operating cluster, classifying most
+        ON-readings as OFF.  Use THRESHOLD_MIN instead (any nonzero draw is ON).
     """
     thresholds = {}
     for app in APPLIANCES:
         col     = df[app]
-        nonzero = col[col > 0]
+        nonzero = col[col > 0].values
         if len(nonzero) == 0:
             thresholds[app] = THRESHOLD_MIN
+            continue
+        p10 = float(np.percentile(nonzero, 10))
+        if p10 > STANDBY_CAP_W:
+            # Cycling appliance: no standby draw — ON = any nonzero reading
+            thresholds[app] = THRESHOLD_MIN
         else:
-            standby         = float(nonzero.quantile(THRESHOLD_LOW_PCT))
-            thresholds[app] = max(standby + THRESHOLD_DELTA, THRESHOLD_MIN)
+            # Standby appliance: threshold above the standby cluster
+            p5 = float(np.percentile(nonzero, 5))
+            thresholds[app] = max(p5 + THRESHOLD_DELTA, THRESHOLD_MIN)
     return thresholds
 
 
