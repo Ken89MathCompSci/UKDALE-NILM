@@ -1,0 +1,5 @@
+"appliance","mae_watts","actual_wh","estimated_wh","energy_error_wh"
+"dishwasher","65.02","1102.18","765.96","-336.22"
+"fridge","36.11","920.45","868.5","-51.95"
+"microwave","79.25","260.22","2028.08","1767.86"
+"washing_machine","94.55","942.97","1873.08","930.12"
