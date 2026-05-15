@@ -108,6 +108,7 @@ THRESHOLD_MIN     = 10.0   # floor (W)
 CYCLING_P5_W      = 80.0
 
 POS_WEIGHT_CLAMP = (1.0, 50.0)
+LAMBDA_SPARSE    = 0.005  # L1 sparsity on power predictions (reduces over-prediction)
 
 # appliance names match the CSV column names
 APPLIANCES  = ['dishwasher', 'fridge', 'microwave', 'washing_machine']
@@ -142,6 +143,25 @@ def compute_adaptive_thresholds(df: pd.DataFrame) -> dict:
         if p5 > CYCLING_P5_W:
             thresholds[app] = THRESHOLD_MIN
         else:
+            thresholds[app] = max(p5 + THRESHOLD_DELTA, THRESHOLD_MIN)
+    return thresholds
+
+
+def compute_event_thresholds(df: pd.DataFrame) -> dict:
+    """
+    Pure p5+delta thresholds used only for event BCE training targets.
+    No cycling override — keeps fridge ON fraction low (~2%) so the model
+    learns that fridge is mostly OFF, not that it is ON 45% of the time.
+    Evaluation still uses compute_adaptive_thresholds (cycling fix at 10W).
+    """
+    thresholds = {}
+    for app in APPLIANCES:
+        col     = df[app]
+        nonzero = col[col > 0]
+        if len(nonzero) == 0:
+            thresholds[app] = THRESHOLD_MIN
+        else:
+            p5 = float(nonzero.quantile(THRESHOLD_LOW_PCT))
             thresholds[app] = max(p5 + THRESHOLD_DELTA, THRESHOLD_MIN)
     return thresholds
 
@@ -501,15 +521,21 @@ def train(data_dict: dict, save_dir: str,
     df_te = data_dict['test']
     n_tr, n_va, n_te = len(df_tr), len(df_va), len(df_te)
 
-    # FIX 9: adaptive thresholds per split
+    # FIX 9: adaptive thresholds per split (cycling fix — used for evaluation)
     tr_thresholds = compute_adaptive_thresholds(df_tr)
     va_thresholds = compute_adaptive_thresholds(df_va)
     te_thresholds = compute_adaptive_thresholds(df_te)
-    print("  Adaptive thresholds (W):")
+    # Event BCE uses pure p5+delta (no cycling override) so cycling appliances
+    # like fridge stay at ~2% ON during training instead of 45%.
+    tr_event_thr  = compute_event_thresholds(df_tr)
+    print("  Eval thresholds (W):        [used for metrics]")
     print(f"  {'Appliance':<16} {'Train':>8} {'Val':>8} {'Test':>8}")
     for app in APPLIANCES:
         print(f"  {app:<16} {tr_thresholds[app]:>8.1f} "
               f"{va_thresholds[app]:>8.1f} {te_thresholds[app]:>8.1f}")
+    print("  Event BCE thresholds (W):   [used for training targets]")
+    for app in APPLIANCES:
+        print(f"  {app:<16} {tr_event_thr[app]:>8.1f}")
 
     # Sequences  [FIX 2]
     print("\nCreating sequences ...")
@@ -543,9 +569,9 @@ def train(data_dict: dict, save_dir: str,
         Y_te[:, :, i] = ys.transform(    Y_te[:, :, i].reshape(-1, 1)).reshape(-1, WIN)
         y_scalers.append(ys)
 
-    # Scaled thresholds (training split) for event BCE targets
+    # Scaled event thresholds for event BCE targets (pure p5+delta, not cycling fix)
     thresholds_scaled = [
-        (tr_thresholds[app] - float(y_scalers[i].data_min_[0]))
+        (tr_event_thr[app] - float(y_scalers[i].data_min_[0]))
         / float(y_scalers[i].data_range_[0])
         for i, app in enumerate(APPLIANCES)
     ]
@@ -602,14 +628,16 @@ def train(data_dict: dict, save_dir: str,
 
             power_pred, event_logits = model(xb)
 
-            l_mse  = mse_crit(power_pred, yb)
-            l_phys = phys_crit(xb, power_pred)    # FIX 3: all timesteps
-            l_ev   = event_crit(event_logits, yb)  # FIX 8: BCEWithLogits
+            l_mse    = mse_crit(power_pred, yb)
+            l_phys   = phys_crit(xb, power_pred)    # FIX 3: all timesteps
+            l_ev     = event_crit(event_logits, yb)  # FIX 8: BCEWithLogits
+            l_sparse = power_pred.mean()             # L1 sparsity: penalise over-prediction
 
             if epoch < WARMUP_EPOCHS:
-                loss = l_mse
+                loss = l_mse + LAMBDA_SPARSE * l_sparse
             else:
-                loss = l_mse + lambda_phys * l_phys + lambda_event * l_ev
+                loss = (l_mse + lambda_phys * l_phys
+                        + lambda_event * l_ev + LAMBDA_SPARSE * l_sparse)
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
