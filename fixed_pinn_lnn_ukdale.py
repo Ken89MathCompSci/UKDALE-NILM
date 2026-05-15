@@ -73,7 +73,6 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 from tqdm import tqdm
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
-from sklearn.cluster import KMeans
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'Source Code'))
 from utils import calculate_nilm_metrics
@@ -103,12 +102,10 @@ WARMUP_EPOCHS = 20
 THRESHOLD_DELTA   = 20.0   # W above standby = definitely ON
 THRESHOLD_LOW_PCT = 0.05   # p5 of nonzero readings = standby estimate
 THRESHOLD_MIN     = 10.0   # floor (W)
-# Bimodal fix: 2-means on nonzero readings.  If the high cluster center is
-# more than BIMODAL_RATIO x the low cluster center, the appliance has a true
-# standby+operating separation → use p5+delta.  Otherwise it is a cycling
-# appliance (fridge: 0W↔110W, single cluster) → use THRESHOLD_MIN.
-BIMODAL_RATIO     = 3.0   # high_center > low_center * (1 + ratio) → bimodal
-KMEANS_MIN_N      = 50    # fall back to p5+delta if fewer nonzero samples
+# If p5(nonzero) > this, the appliance has no low-power standby (cycling
+# device: 0W OFF, 100W+ ON) — p5+delta would land inside the operating
+# cluster.  Use THRESHOLD_MIN instead so any nonzero draw counts as ON.
+CYCLING_P5_W      = 80.0
 
 POS_WEIGHT_CLAMP = (1.0, 50.0)
 
@@ -125,48 +122,27 @@ DATA_DIR = os.path.join(os.path.dirname(__file__), 'dataset')
 
 def compute_adaptive_thresholds(df: pd.DataFrame) -> dict:
     """
-    2-means bimodal-aware adaptive threshold per appliance.
+    Standby = p5 of nonzero readings per appliance.
+    Threshold = standby + THRESHOLD_DELTA, floored at THRESHOLD_MIN.
 
-    Fit KMeans(k=2) on nonzero readings.  Sort cluster centers low/high.
-    If high_center > low_center * (1 + BIMODAL_RATIO), the distribution is
-    bimodal (standby cluster + operating cluster) → threshold = p5 + delta
-    sits between them.
-
-    If the two centers are close (unimodal), the appliance cycles between
-    exactly 0W and one operating level (fridge) — any nonzero draw is ON →
-    threshold = THRESHOLD_MIN.
-
-    Examples:
-      Fridge H5  : nonzero all ~106-200W → centers [120W, 165W]
-                   165 < 120*(1+3)=480 → unimodal → 10W ✓
-      Dishwasher H5: nonzero 57W phases + 1500W cycle
-                   centers ≈ [70W, 1400W], 1400 > 70*4=280 → bimodal → 77W ✓
-      Microwave H5 : standby 25W + cooking 800W+
-                   centers ≈ [25W, 820W], 820 > 25*4=100 → bimodal → 68W ✓
+    Exception — cycling appliances (fridge):
+      When p5(nonzero) > CYCLING_P5_W the device has no low-power standby;
+      it is either OFF (0W) or fully running (100W+).  The p5+delta formula
+      would land inside the operating cluster and classify most ON-readings
+      as OFF.  Use THRESHOLD_MIN so any nonzero draw is treated as ON.
     """
     thresholds = {}
     for app in APPLIANCES:
         col     = df[app]
-        nonzero = col[col > 0].values
+        nonzero = col[col > 0]
         if len(nonzero) == 0:
             thresholds[app] = THRESHOLD_MIN
             continue
-
-        p5 = float(np.percentile(nonzero, 5))
-
-        if len(nonzero) >= KMEANS_MIN_N:
-            km  = KMeans(n_clusters=2, n_init=10, random_state=42)
-            km.fit(nonzero.reshape(-1, 1))
-            low, high = sorted(km.cluster_centers_.flatten())
-            bimodal = high > low * (1.0 + BIMODAL_RATIO)
-        else:
-            bimodal = True  # too few samples to cluster; trust p5+delta
-
-        if bimodal:
-            thresholds[app] = max(p5 + THRESHOLD_DELTA, THRESHOLD_MIN)
-        else:
-            # Unimodal cycling appliance: ON = any nonzero draw
+        p5 = float(nonzero.quantile(THRESHOLD_LOW_PCT))
+        if p5 > CYCLING_P5_W:
             thresholds[app] = THRESHOLD_MIN
+        else:
+            thresholds[app] = max(p5 + THRESHOLD_DELTA, THRESHOLD_MIN)
     return thresholds
 
 
@@ -491,7 +467,15 @@ def per_app_metrics(y_true: np.ndarray, y_pred: np.ndarray,
     for i, app in enumerate(APPLIANCES):
         raw_t = y_scalers[i].inverse_transform(y_true[:, i:i+1]).flatten()
         raw_p = y_scalers[i].inverse_transform(y_pred[:, i:i+1]).flatten()
-        out[app] = calculate_nilm_metrics(raw_t, raw_p, threshold=thresholds[app])
+        m = calculate_nilm_metrics(raw_t, raw_p, threshold=thresholds[app])
+        thr = thresholds[app]
+        t_on = raw_t > thr
+        p_on = raw_p > thr
+        m['tp'] = int(np.sum( t_on &  p_on))
+        m['tn'] = int(np.sum(~t_on & ~p_on))
+        m['fp'] = int(np.sum(~t_on &  p_on))
+        m['fn'] = int(np.sum( t_on & ~p_on))
+        out[app] = m
     return out
 
 
@@ -689,7 +673,8 @@ def train(data_dict: dict, save_dir: str,
         for app in APPLIANCES:
             m = vm[app]
             print(f"    {app:<16}  F1={m['f1']:.4f}  P={m['precision']:.4f}  "
-                  f"R={m['recall']:.4f}  MAE={m['mae']:.2f}  SAE={m['sae']:.4f}")
+                  f"R={m['recall']:.4f}  MAE={m['mae']:.2f}  "
+                  f"TP={m['tp']:,d}  TN={m['tn']:,d}  FP={m['fp']:,d}  FN={m['fn']:,d}")
 
         if avg_va_mse < best_val_mse:
             best_val_mse = avg_va_mse
@@ -719,13 +704,14 @@ def train(data_dict: dict, save_dir: str,
     true_trace_te = reconstruct_trace(te_trues, n_te, WIN, WIN)
     test_metrics  = per_app_metrics(true_trace_te, pred_trace_te, y_scalers, te_thresholds)
 
-    print(f"\n{'Appliance':<18} {'F1':>8} {'Precision':>10} "
-          f"{'Recall':>8} {'MAE':>8} {'SAE':>8}")
-    print("-" * 65)
+    print(f"\n{'Appliance':<18} {'F1':>7} {'Prec':>7} {'Rec':>7} "
+          f"{'MAE':>7} {'TP':>7} {'TN':>7} {'FP':>7} {'FN':>7}")
+    print("-" * 77)
     for app in APPLIANCES:
         m = test_metrics[app]
-        print(f"{app:<18} {m['f1']:>8.4f} {m['precision']:>10.4f} "
-              f"{m['recall']:>8.4f} {m['mae']:>8.2f} {m['sae']:>8.4f}")
+        print(f"{app:<18} {m['f1']:>7.4f} {m['precision']:>7.4f} {m['recall']:>7.4f} "
+              f"{m['mae']:>7.2f} {m['tp']:>7,d} {m['tn']:>7,d} "
+              f"{m['fp']:>7,d} {m['fn']:>7,d}")
 
     _plot_loss(history, save_dir)
     _plot_metrics(history, test_metrics, save_dir)
