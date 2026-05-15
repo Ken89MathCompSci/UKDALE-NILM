@@ -59,8 +59,9 @@ BATCH    = 32
 WIN      = 100
 STRIDE   = 5
 
-LAMBDA_PHYS = 0.01
-EPSILON_W   = 50.0
+LAMBDA_PHYS   = 0.01
+EPSILON_W     = 50.0
+LAMBDA_SPARSE = 0.005  # L1 sparsity: penalises non-zero predictions, fixes over-prediction
 
 APPLIANCES = ['dishwasher', 'fridge', 'microwave', 'washing_machine']
 AGG_COL    = 'aggregate'
@@ -419,10 +420,11 @@ def train_model(data_dict: dict, save_dir: str,
         for xb, yb in pbar:
             xb, yb = xb.to(device), yb.to(device)
             opt.zero_grad()
-            pred   = model(xb)
-            l_mse  = mse_crit(pred, yb)
-            l_phys = phys_crit(xb, pred)
-            loss   = l_mse + lambda_phys * l_phys
+            pred     = model(xb)
+            l_mse    = mse_crit(pred, yb)
+            l_phys   = phys_crit(xb, pred)
+            l_sparse = pred.mean()
+            loss     = l_mse + lambda_phys * l_phys + LAMBDA_SPARSE * l_sparse
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
