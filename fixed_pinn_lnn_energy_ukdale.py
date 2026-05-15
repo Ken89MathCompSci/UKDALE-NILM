@@ -60,8 +60,10 @@ Architecture after fixes:
     n_apps x Linear(h*2,1)+sig   n_apps x Linear(h*2,1)
     (batch, WIN, n_apps)          (batch, WIN, n_apps)
 
-Loss:  L = L_MSE + lambda_phys * L_phys_time + lambda_event * L_event
-Warmup: MSE-only for first WARMUP_EPOCHS epochs, then add physics + event losses.
+Loss:  L = L_MSE + ramp * (lambda_phys * L_phys_time
+                            + lambda_event * L_event)
+Warmup: MSE-only for first WARMUP_EPOCHS epochs, then ramp physics + event
+losses from 0 -> 1 over RAMP_EPOCHS epochs.
 """
 
 import sys
@@ -100,6 +102,7 @@ LAMBDA_PHYS   = 0.01
 LAMBDA_EVENT  = 0.05
 EPSILON_W     = 50.0
 WARMUP_EPOCHS = 20
+RAMP_EPOCHS   = 15      # after warmup, fade physics/event losses in gradually
 
 # FIX 9: replaced hardcoded THRESHOLDS with adaptive per-split computation
 THRESHOLD_DELTA   = 20.0   # W above standby = definitely ON
@@ -119,6 +122,23 @@ AGG_COL     = 'aggregate'
 SAMPLE_PERIOD_SECONDS = 6.0
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), 'dataset')
+
+
+def auxiliary_loss_scale(epoch: int,
+                         warmup_epochs: int = WARMUP_EPOCHS,
+                         ramp_epochs: int = RAMP_EPOCHS) -> float:
+    """
+    Smoothly introduce physics/event losses after warmup.
+
+    Epoch is zero-based: with warmup=20 and ramp=15, epoch 20 (printed as
+    Epoch 21) uses 1/15 of the configured auxiliary weights, and epoch 34
+    (printed as Epoch 35) reaches the full weights.
+    """
+    if epoch < warmup_epochs:
+        return 0.0
+    if ramp_epochs <= 0:
+        return 1.0
+    return min(1.0, (epoch - warmup_epochs + 1) / ramp_epochs)
 
 
 # ---------------------------------------------------------------------------
@@ -529,12 +549,15 @@ def energy_estimation_metrics(y_true: np.ndarray, y_pred: np.ndarray,
         abs_err_wh = abs(err_wh)
         pct_err = (err_wh / true_wh * 100.0) if true_wh > 1e-9 else 0.0
         abs_pct_err = abs(pct_err)
+        sae = (abs_err_wh / true_wh) if true_wh > 1e-9 else 0.0
 
         out[app] = {
             'true_wh': true_wh,
             'pred_wh': pred_wh,
             'error_wh': err_wh,
             'abs_error_wh': abs_err_wh,
+            'sae': sae,
+            'sae_percent': sae * 100.0,
             'pct_error': pct_err,
             'abs_pct_error': abs_pct_err,
         }
@@ -547,6 +570,10 @@ def energy_estimation_metrics(y_true: np.ndarray, y_pred: np.ndarray,
         'pred_wh': total_pred_wh,
         'error_wh': total_err_wh,
         'abs_error_wh': abs(total_err_wh),
+        'sae': (abs(total_err_wh) / total_true_wh)
+               if total_true_wh > 1e-9 else 0.0,
+        'sae_percent': (abs(total_err_wh) / total_true_wh * 100.0)
+                       if total_true_wh > 1e-9 else 0.0,
         'pct_error': (total_err_wh / total_true_wh * 100.0)
                      if total_true_wh > 1e-9 else 0.0,
         'abs_pct_error': (abs(total_err_wh) / total_true_wh * 100.0)
@@ -662,17 +689,23 @@ def train(data_dict: dict, save_dir: str,
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"\nModel parameters: {n_params:,}")
-    print(f"Warmup: MSE-only for {WARMUP_EPOCHS} epochs, then + physics + event.\n")
+    print(f"Warmup: MSE-only for {WARMUP_EPOCHS} epochs, then ramp "
+          f"physics + event over {RAMP_EPOCHS} epochs.\n")
 
     history = {k: [] for k in [
         'train_loss', 'train_mse', 'train_phys', 'train_event',
         'val_loss',   'val_mse',   'val_phys',   'val_metrics',
+        'aux_scale',  'lambda_phys_eff', 'lambda_event_eff',
     ]}
     best_val_mse = float('inf')
     best_state   = None
     counter      = 0
 
     for epoch in range(EPOCHS):
+        aux_scale = auxiliary_loss_scale(epoch)
+        lambda_phys_eff = aux_scale * lambda_phys
+        lambda_event_eff = aux_scale * lambda_event
+
         # ── Train ──────────────────────────────────────────────────────────
         model.train()
         ep_tot = ep_mse = ep_phys = ep_ev = 0.0
@@ -689,11 +722,10 @@ def train(data_dict: dict, save_dir: str,
             l_ev     = event_crit(event_logits, yb)  # FIX 8: BCEWithLogits
             l_sparse = power_pred.mean()             # L1 sparsity: penalise over-prediction
 
-            if epoch < WARMUP_EPOCHS:
-                loss = l_mse + LAMBDA_SPARSE * l_sparse
-            else:
-                loss = (l_mse + lambda_phys * l_phys
-                        + lambda_event * l_ev + LAMBDA_SPARSE * l_sparse)
+            loss = (l_mse
+                    + lambda_phys_eff * l_phys
+                    + lambda_event_eff * l_ev
+                    + LAMBDA_SPARSE * l_sparse)
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -710,6 +742,9 @@ def train(data_dict: dict, save_dir: str,
         history['train_mse'].append(ep_mse   / nb)
         history['train_phys'].append(ep_phys / nb)
         history['train_event'].append(ep_ev  / nb)
+        history['aux_scale'].append(aux_scale)
+        history['lambda_phys_eff'].append(lambda_phys_eff)
+        history['lambda_event_eff'].append(lambda_event_eff)
 
         # ── Validate ────────────────────────────────────────────────────────
         model.eval()
@@ -724,7 +759,7 @@ def train(data_dict: dict, save_dir: str,
                 l_phys = phys_crit(xb, power_pred)
                 vl_mse  += l_mse.item()
                 vl_phys += l_phys.item()
-                vl_tot  += (l_mse + lambda_phys * l_phys).item()
+                vl_tot  += (l_mse + lambda_phys_eff * l_phys).item()
                 for b in range(power_pred.shape[0]):
                     va_preds.append(power_pred[b].cpu().numpy())
                     va_trues.append(yb[b].cpu().numpy())
@@ -743,7 +778,12 @@ def train(data_dict: dict, save_dir: str,
 
         avg_f1  = np.mean([vm[a]['f1']  for a in APPLIANCES])
         avg_mae = np.mean([vm[a]['mae'] for a in APPLIANCES])
-        status  = "WARMUP" if epoch < WARMUP_EPOCHS else "FULL  "
+        if aux_scale == 0.0:
+            status = "WARMUP"
+        elif aux_scale < 1.0:
+            status = "RAMP  "
+        else:
+            status = "FULL  "
         print(
             f"  [{status}] Epoch {epoch+1:3d}/{EPOCHS}  "
             f"train={history['train_loss'][-1]:.5f} "
@@ -752,6 +792,7 @@ def train(data_dict: dict, save_dir: str,
             f"ev={history['train_event'][-1]:.5f})  "
             f"val_mse={avg_va_mse:.5f}  "
             f"avgF1={avg_f1:.4f}  avgMAE={avg_mae:.2f}  "
+            f"aux={aux_scale:.2f}  "
             f"lr={opt.param_groups[0]['lr']:.2e}"
         )
         for app in APPLIANCES:
@@ -799,13 +840,13 @@ def train(data_dict: dict, save_dir: str,
               f"{m['fp']:>7,d} {m['fn']:>7,d}")
 
     print(f"\n{'Appliance':<18} {'True Wh':>10} {'Pred Wh':>10} "
-          f"{'Err Wh':>10} {'Abs Err':>10} {'Pct Err':>9}")
-    print("-" * 73)
+          f"{'Err Wh':>10} {'Abs Err':>10} {'SAE':>8} {'Pct Err':>9}")
+    print("-" * 82)
     for app in APPLIANCES + ['total_labelled']:
         m = energy_metrics[app]
         print(f"{app:<18} {m['true_wh']:>10.2f} {m['pred_wh']:>10.2f} "
               f"{m['error_wh']:>10.2f} {m['abs_error_wh']:>10.2f} "
-              f"{m['pct_error']:>8.2f}%")
+              f"{m['sae']:>8.4f} {m['pct_error']:>8.2f}%")
 
     _plot_loss(history, save_dir)
     _plot_metrics(history, test_metrics, save_dir)
@@ -832,7 +873,9 @@ def train(data_dict: dict, save_dir: str,
                          'n_apps': len(APPLIANCES), 'dt': dt},
         'train_params': {'lr': LR, 'epochs': EPOCHS, 'patience': PATIENCE,
                          'lambda_phys': lambda_phys, 'lambda_event': lambda_event,
-                         'epsilon_w': epsilon_w, 'warmup_epochs': WARMUP_EPOCHS},
+                         'epsilon_w': epsilon_w, 'warmup_epochs': WARMUP_EPOCHS,
+                         'ramp_epochs': RAMP_EPOCHS,
+                         'auxiliary_loss_schedule': 'linear_after_warmup'},
         'test_metrics': {
             app: {k: float(v) for k, v in m.items()}
             for app, m in test_metrics.items()
