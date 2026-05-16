@@ -2,7 +2,7 @@
 Preprocessing script for UKDALE high-frequency (6s) NILM dataset.
 
 Splits:
-  Training  : House 1, 2014-06-01 to 2014-11-30  (~183 days)
+  Training  : House 1, 2014-11-01 to 2014-11-30  (~30 days)
   Validation: House 1, 2014-12-01 to 2014-12-14  (~14 days)
   Testing   : House 5, 2014-08-24 to 2014-09-06  (~14 days)
 
@@ -20,7 +20,7 @@ import pandas as pd
 # ── paths ──────────────────────────────────────────────────────────────────────
 BASE      = os.path.dirname(os.path.abspath(__file__))
 UKDALE    = os.path.join(BASE, "ukdale")
-OUT_DIR   = os.path.join(BASE, "long_dataset")
+OUT_DIR   = os.path.join(BASE, "medium_dataset")
 os.makedirs(OUT_DIR, exist_ok=True)
 
 # ── channel maps ───────────────────────────────────────────────────────────────
@@ -48,22 +48,22 @@ SPLITS = [
         "name":  "train",
         "house": 1,
         "channels": H1_CHANNELS,
-        "start": "2014-06-01 00:00:00",
-        "end":   "2014-11-30 23:59:54",   # ~183 days (~2 635 200 rows)
+        "start": "2014-11-01 00:00:00",
+        "end":   "2014-11-30 23:59:54",   # ~30 days (~432 000 rows)
     },
     {
         "name":  "validation",
         "house": 1,
         "channels": H1_CHANNELS,
         "start": "2014-12-01 00:00:00",
-        "end":   "2014-12-14 23:59:54",   # 14 days (~201 600 rows)
+        "end":   "2014-12-07 23:59:54",   # 7 days (~100 800 rows)
     },
     {
         "name":  "test",
         "house": 5,
         "channels": H5_CHANNELS,
         "start": "2014-08-24 00:00:00",
-        "end":   "2014-09-06 23:59:54",   # 14 days (~201 600 rows)
+        "end":   "2014-08-30 23:59:54",   # 7 days (~100 800 rows)
     },
 ]
 

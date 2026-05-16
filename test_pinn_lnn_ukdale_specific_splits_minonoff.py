@@ -75,8 +75,10 @@ MIN_OFF = {
     'washing_machine':  27,   # 162 s
 }
 
-BCE_LAMBDA = {'dishwasher': 0.5, 'fridge': 0.3, 'microwave': 0.0, 'washing_machine': 0.0}
-BCE_ALPHA  = {'dishwasher': 2.0, 'fridge': 2.0, 'microwave': 1.0, 'washing_machine': 1.0}
+LAMBDA_SPARSE = 0.005   # L1 sparsity — prevents over-prediction collapse
+
+BCE_LAMBDA = {'dishwasher': 0.1, 'fridge': 0.05, 'microwave': 0.0, 'washing_machine': 0.0}
+BCE_ALPHA  = {'dishwasher': 2.0, 'fridge': 2.0,  'microwave': 1.0, 'washing_machine': 1.0}
 
 DEFAULT_DATASET_DIR = 'new_dataset'
 
@@ -377,9 +379,10 @@ def train_pinn_model(data_dict, save_dir,
             mse_loss  = mse_criterion(pred, yb)
             x_mid     = xb[:, WIN // 2, 0]
             phys_loss = phys_criterion(x_mid, pred)
+            l_sparse  = pred.mean()
 
             if epoch < WARMUP_EPOCHS:
-                loss = mse_loss
+                loss = mse_loss + LAMBDA_SPARSE * l_sparse
             else:
                 bce_loss = torch.tensor(0.0, device=device)
                 for i, app in enumerate(APPLIANCES):
@@ -392,7 +395,7 @@ def train_pinn_model(data_dict, save_dir,
                                              torch.ones_like(y_bin))
                         bce_loss = bce_loss + BCE_LAMBDA[app] * F.binary_cross_entropy(
                             pred_i, y_bin, weight=w)
-                loss = mse_loss + lambda_phys * phys_loss + bce_loss
+                loss = mse_loss + lambda_phys * phys_loss + LAMBDA_SPARSE * l_sparse + bce_loss
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
