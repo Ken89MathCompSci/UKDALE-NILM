@@ -24,15 +24,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import json
 from datetime import datetime
 from tqdm import tqdm
-import pickle
 from sklearn.preprocessing import MinMaxScaler
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'Source Code'))
-from utils import calculate_nilm_metrics, save_model
+from utils import calculate_nilm_metrics
 
 
 # ---------------------------------------------------------------------------
@@ -50,33 +50,35 @@ LAMBDA_PHYS   = 0.01
 EPSILON_W     = 50.0
 WARMUP_EPOCHS = 20
 
-APPLIANCES = ['dish washer', 'fridge', 'microwave', 'washer dryer']
+APPLIANCES = ['dishwasher', 'fridge', 'microwave', 'washing_machine']
 
 THRESHOLDS = {
-    'dish washer':  10.0,
-    'fridge':       10.0,
-    'microwave':    10.0,
-    'washer dryer':  0.5,
+    'dishwasher':      10.0,
+    'fridge':          10.0,
+    'microwave':       10.0,
+    'washing_machine': 10.0,
 }
 
 # Minimum ON duration in 6-second timesteps before an activation is accepted
 MIN_ON = {
-    'dish washer':  300,   # 30 min
-    'fridge':        10,   # 1 min
-    'microwave':      2,   # 12 s
-    'washer dryer': 300,   # 30 min
+    'dishwasher':      300,   # 30 min
+    'fridge':           10,   # 1 min
+    'microwave':         2,   # 12 s
+    'washing_machine': 300,   # 30 min
 }
 
 # Minimum OFF duration in 6-second timesteps before a deactivation is accepted
 MIN_OFF = {
-    'dish washer':  300,   # 30 min
-    'fridge':         2,   # 12 s
-    'microwave':      5,   # 30 s
-    'washer dryer':  27,   # 162 s
+    'dishwasher':      300,   # 30 min
+    'fridge':            2,   # 12 s
+    'microwave':         5,   # 30 s
+    'washing_machine':  27,   # 162 s
 }
 
-BCE_LAMBDA = {'dish washer': 0.5, 'fridge': 0.3, 'microwave': 0.0, 'washer dryer': 0.0}
-BCE_ALPHA  = {'dish washer': 2.0, 'fridge': 2.0, 'microwave': 1.0, 'washer dryer': 1.0}
+BCE_LAMBDA = {'dishwasher': 0.5, 'fridge': 0.3, 'microwave': 0.0, 'washing_machine': 0.0}
+BCE_ALPHA  = {'dishwasher': 2.0, 'fridge': 2.0, 'microwave': 1.0, 'washing_machine': 1.0}
+
+DEFAULT_DATASET_DIR = 'new_dataset'
 
 
 # ---------------------------------------------------------------------------
@@ -219,26 +221,23 @@ class MultiApplianceDataset(torch.utils.data.Dataset):
 # Data helpers
 # ---------------------------------------------------------------------------
 
-def load_data():
-    print("Loading UKDALE data...")
-    with open('data/ukdale/train_small.pkl', 'rb') as f:
-        train_data = pickle.load(f)[0]
-    with open('data/ukdale/val_small.pkl', 'rb') as f:
-        val_data = pickle.load(f)[0]
-    with open('data/ukdale/test_small.pkl', 'rb') as f:
-        test_data = pickle.load(f)[0]
-
-    print(f"Train date range: {train_data.index.min()} to {train_data.index.max()}")
-    print(f"Val   date range: {val_data.index.min()} to {val_data.index.max()}")
-    print(f"Test  date range: {test_data.index.min()} to {test_data.index.max()}")
-    print(f"Available columns: {list(train_data.columns)}")
-    return {'train': train_data, 'val': val_data, 'test': test_data}
+def load_data(dataset_dir=DEFAULT_DATASET_DIR):
+    print(f"Loading CSVs from '{dataset_dir}/'...")
+    splits = {}
+    for split in ('train', 'validation', 'test'):
+        path = os.path.join(dataset_dir, f'UKDALE_HF_{split}.csv')
+        df   = pd.read_csv(path, index_col='timestamp', parse_dates=True)
+        splits[split] = df
+        print(f"  {split:12s}: {df.shape}  "
+              f"{df.index[0].date()} → {df.index[-1].date()}")
+    print(f"  Columns: {list(splits['train'].columns)}")
+    return splits
 
 
 def create_sequences(data, window_size=WIN):
     """Midpoint targeting — y[i] is the appliance values at the window centre."""
-    mains    = data['main'].values
-    app_vals = {app: data[app].values for app in APPLIANCES}
+    mains    = data['aggregate'].values.astype(np.float32)
+    app_vals = {app: data[app].values.astype(np.float32) for app in APPLIANCES}
     X, Y = [], []
     for i in range(0, len(mains) - window_size, STRIDE):
         X.append(mains[i:i + window_size])
@@ -304,9 +303,9 @@ def train_pinn_model(data_dict, save_dir,
     print(f"Min ON  : { {a: MIN_ON[a]  for a in APPLIANCES} }")
     print(f"Min OFF : { {a: MIN_OFF[a] for a in APPLIANCES} }")
 
-    X_tr, Y_tr = create_sequences(data_dict['train'], WIN)
-    X_va, Y_va = create_sequences(data_dict['val'],   WIN)
-    X_te, Y_te = create_sequences(data_dict['test'],  WIN)
+    X_tr, Y_tr = create_sequences(data_dict['train'],      WIN)
+    X_va, Y_va = create_sequences(data_dict['validation'], WIN)
+    X_te, Y_te = create_sequences(data_dict['test'],       WIN)
 
     x_scaler = MinMaxScaler()
     X_tr = x_scaler.fit_transform(X_tr.reshape(-1, 1)).reshape(X_tr.shape)
@@ -601,24 +600,34 @@ def _plot_training(history, test_metrics, save_dir):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    for f in ['data/ukdale/train_small.pkl', 'data/ukdale/val_small.pkl',
-              'data/ukdale/test_small.pkl']:
-        if not os.path.exists(f):
-            print(f"Error: {f} not found!")
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--dataset-dir', default=DEFAULT_DATASET_DIR,
+                        help='Directory containing UKDALE_HF_*.csv files')
+    parser.add_argument('--hidden-size', type=int,   default=64)
+    parser.add_argument('--dt',          type=float, default=0.1)
+    parser.add_argument('--lambda-phys', type=float, default=LAMBDA_PHYS)
+    parser.add_argument('--epsilon-w',   type=float, default=EPSILON_W)
+    args = parser.parse_args()
+
+    for split in ('train', 'validation', 'test'):
+        p = os.path.join(args.dataset_dir, f'UKDALE_HF_{split}.csv')
+        if not os.path.exists(p):
+            print(f"Error: {p} not found!")
             sys.exit(1)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     save_dir  = f"models/pinn_lnn_ukdale_minonoff_{timestamp}"
 
-    data_dict = load_data()
+    data_dict = load_data(args.dataset_dir)
 
     test_metrics, history = train_pinn_model(
         data_dict,
         save_dir    = save_dir,
-        hidden_size = 64,
-        dt          = 0.1,
-        lambda_phys = LAMBDA_PHYS,
-        epsilon_w   = EPSILON_W,
+        hidden_size = args.hidden_size,
+        dt          = args.dt,
+        lambda_phys = args.lambda_phys,
+        epsilon_w   = args.epsilon_w,
     )
 
     print(f"\nResults saved to {save_dir}")
