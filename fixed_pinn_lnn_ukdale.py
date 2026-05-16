@@ -628,16 +628,14 @@ def train(data_dict: dict, save_dir: str,
 
             power_pred, event_logits = model(xb)
 
-            l_mse    = mse_crit(power_pred, yb)
-            l_phys   = phys_crit(xb, power_pred)    # FIX 3: all timesteps
-            l_ev     = event_crit(event_logits, yb)  # FIX 8: BCEWithLogits
-            l_sparse = power_pred.mean()             # L1 sparsity: penalise over-prediction
+            l_mse  = mse_crit(power_pred, yb)
+            l_phys = phys_crit(xb, power_pred)    # FIX 3: all timesteps
+            l_ev   = event_crit(event_logits, yb)  # FIX 8: BCEWithLogits
 
             if epoch < WARMUP_EPOCHS:
-                loss = l_mse + LAMBDA_SPARSE * l_sparse
+                loss = l_mse
             else:
-                loss = (l_mse + lambda_phys * l_phys
-                        + lambda_event * l_ev + LAMBDA_SPARSE * l_sparse)
+                loss = l_mse + lambda_phys * l_phys + lambda_event * l_ev
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -833,6 +831,20 @@ def _plot_metrics(history: dict, test_metrics: dict, save_dir: str) -> None:
 # ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--dataset-dir', default=None,
+                        help='Directory containing UKDALE_HF_*.csv files '
+                             '(overrides built-in DATA_DIR)')
+    parser.add_argument('--hidden',       type=int,   default=64)
+    parser.add_argument('--lambda-phys',  type=float, default=LAMBDA_PHYS)
+    parser.add_argument('--lambda-event', type=float, default=LAMBDA_EVENT)
+    parser.add_argument('--epsilon-w',    type=float, default=EPSILON_W)
+    args = parser.parse_args()
+
+    if args.dataset_dir is not None:
+        DATA_DIR = args.dataset_dir
+
     for f in ['UKDALE_HF_train.csv', 'UKDALE_HF_validation.csv', 'UKDALE_HF_test.csv']:
         p = os.path.join(DATA_DIR, f)
         if not os.path.exists(p):
@@ -847,9 +859,9 @@ if __name__ == '__main__':
     train(
         data_dict,
         save_dir     = save_dir,
-        hidden       = 64,
+        hidden       = args.hidden,
         dt           = 0.1,
-        lambda_phys  = LAMBDA_PHYS,
-        lambda_event = LAMBDA_EVENT,
-        epsilon_w    = EPSILON_W,
+        lambda_phys  = args.lambda_phys,
+        lambda_event = args.lambda_event,
+        epsilon_w    = args.epsilon_w,
     )
