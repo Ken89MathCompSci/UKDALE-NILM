@@ -2,9 +2,13 @@
 Preprocessing script for UKDALE high-frequency (6s) NILM dataset.
 
 Splits:
-  Training  : House 1, 2014-11-09, 14400 points
-  Validation: House 1, 2014-12-07, 14400 points
-  Testing   : House 5, 2014-08-24, 14400 points
+  Training  : House 1, 2014-06-01 to 2014-11-30  (~183 days)
+  Validation: House 1, 2014-12-01 to 2014-12-14  (~14 days)
+  Testing   : House 5, 2014-08-24 to 2014-09-06  (~14 days)
+
+Extended from single-day splits to give the model more training signal
+and more stable validation/test estimates.  The gap-filling policy is
+unchanged (forward-fill ≤ 5 min, then zero-fill).
 
 Appliances: Dishwasher, Fridge, Microwave, Washing Machine
 """
@@ -16,7 +20,7 @@ import pandas as pd
 # ── paths ──────────────────────────────────────────────────────────────────────
 BASE      = os.path.dirname(os.path.abspath(__file__))
 UKDALE    = os.path.join(BASE, "ukdale")
-OUT_DIR   = os.path.join(BASE, "dataset")
+OUT_DIR   = os.path.join(BASE, "long_dataset")
 os.makedirs(OUT_DIR, exist_ok=True)
 
 # ── channel maps ───────────────────────────────────────────────────────────────
@@ -44,28 +48,27 @@ SPLITS = [
         "name":  "train",
         "house": 1,
         "channels": H1_CHANNELS,
-        "start": "2014-11-09 00:00:00",
-        "end":   "2014-11-09 23:59:54",
+        "start": "2014-06-01 00:00:00",
+        "end":   "2014-11-30 23:59:54",   # ~183 days (~2 635 200 rows)
     },
     {
         "name":  "validation",
         "house": 1,
         "channels": H1_CHANNELS,
-        "start": "2014-12-07 00:00:00",
-        "end":   "2014-12-07 23:59:54",
+        "start": "2014-12-01 00:00:00",
+        "end":   "2014-12-14 23:59:54",   # 14 days (~201 600 rows)
     },
     {
         "name":  "test",
         "house": 5,
         "channels": H5_CHANNELS,
         "start": "2014-08-24 00:00:00",
-        "end":   "2014-08-24 23:59:54",
+        "end":   "2014-09-06 23:59:54",   # 14 days (~201 600 rows)
     },
 ]
 
-N_POINTS  = 14400          # expected data points per split
-FREQ      = "6s"           # 6-second grid
-MAX_FILL  = 50             # max consecutive 6s steps to forward-fill (~5 min)
+FREQ      = "6s"   # 6-second grid
+MAX_FILL  = 50     # max consecutive 6s steps to forward-fill (~5 min)
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
@@ -125,10 +128,8 @@ def preprocess_split(split: dict) -> None:
     df.index.name = "timestamp"
 
     # ── diagnostics ────────────────────────────────────────────────────────────
-    assert len(df) == N_POINTS, (
-        f"Expected {N_POINTS} rows but got {len(df)}"
-    )
-    print(f"\n  Shape       : {df.shape}")
+    n_days = (df.index[-1] - df.index[0]).total_seconds() / 86400
+    print(f"\n  Shape       : {df.shape}  ({n_days:.1f} days)")
     print(f"  Time range  : {df.index[0]}  ->  {df.index[-1]}")
     print(f"\n  Power stats (W):")
     print(df.describe().round(2).to_string())
