@@ -246,16 +246,25 @@ def activation_stats(arr: np.ndarray, name: str) -> dict:
     }
 
 
-def cka(X: np.ndarray, Y: np.ndarray) -> float:
-    """Linear Centered Kernel Alignment."""
-    def _centre(K):
-        n = K.shape[0]
-        H = np.eye(n) - np.ones((n, n)) / n
-        return H @ K @ H
+def cka(X: np.ndarray, Y: np.ndarray, seed: int = 0) -> float:
+    """
+    Linear Centered Kernel Alignment (kernel formulation).
+
+    Both matrices must have the same n rows.  If they differ, the larger set
+    is subsampled down to match the smaller one so the n×n kernels align.
+    """
+    n = min(len(X), len(Y))
+    rng = np.random.default_rng(seed)
+    if len(X) > n:
+        X = X[rng.choice(len(X), n, replace=False)]
+    if len(Y) > n:
+        Y = Y[rng.choice(len(Y), n, replace=False)]
     X = X - X.mean(0); Y = Y - Y.mean(0)
-    Kx = _centre(X @ X.T); Ky = _centre(Y @ Y.T)
-    return float(np.sum(Kx * Ky) /
-                 (np.sqrt(np.sum(Kx**2)) * np.sqrt(np.sum(Ky**2)) + 1e-12))
+    H   = np.eye(n) - np.ones((n, n)) / n
+    Kxc = H @ (X @ X.T) @ H
+    Kyc = H @ (Y @ Y.T) @ H
+    return float(np.sum(Kxc * Kyc) /
+                 (np.sqrt(np.sum(Kxc ** 2)) * np.sqrt(np.sum(Kyc ** 2)) + 1e-12))
 
 
 def analyse_hidden_states(acts_tr, acts_va, acts_te, out_dir: str):
