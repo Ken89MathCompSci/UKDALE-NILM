@@ -742,6 +742,11 @@ def train(data_dict: dict, save_dir: str,
     _plot_loss(history, save_dir)
     _plot_metrics(history, test_metrics, save_dir)
 
+    # Save best model weights for post-hoc analysis
+    ckpt_path = os.path.join(save_dir, 'best_model.pt')
+    torch.save(best_state, ckpt_path)
+    print(f"  Model checkpoint saved: {ckpt_path}")
+
     cfg = {
         'dataset': 'UKDALE (CSV splits)',
         'model':   'FixedPINNLNN',
