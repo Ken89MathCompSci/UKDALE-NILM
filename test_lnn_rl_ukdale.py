@@ -67,7 +67,8 @@ ROLLOUT_SIZE = 512     # windows per rollout segment
 # Reward shaping
 ALPHA        = 1.0    # disaggregation MAE weight
 BETA_TRANS   = 0.05   # state-transition penalty weight
-GAMMA_SPARSE = 0.5    # sparsity penalty — discourages always-ON collapse
+GAMMA_SPARSE = 0.1    # one-sided over-prediction penalty
+PRETRAIN_EPOCHS = 10  # supervised MSE warm-start before PPO
 NORM_POWER   = 3000.0 # normalisation constant (W) — typical UK household max
 
 THRESHOLDS = {
@@ -222,9 +223,9 @@ def compute_rewards_batch(actions, y_true, prev_actions, y_mins, y_ranges):
     true_raw = y_true       * y_ranges + y_mins
     prev_raw = prev_actions * y_ranges + y_mins
 
-    mae_term     = np.abs(pred_raw - true_raw).mean(axis=1)   # (N,)
-    trans_term   = np.abs(pred_raw - prev_raw).mean(axis=1)   # (N,)
-    sparse_term  = pred_raw.mean(axis=1)                       # (N,) — penalise high predictions
+    mae_term    = np.abs(pred_raw - true_raw).mean(axis=1)              # (N,)
+    trans_term  = np.abs(pred_raw - prev_raw).mean(axis=1)              # (N,)
+    sparse_term = np.maximum(0.0, pred_raw - true_raw).mean(axis=1)     # (N,) — one-sided: only penalise over-prediction
     return -(ALPHA * mae_term + BETA_TRANS * trans_term + GAMMA_SPARSE * sparse_term) / NORM_POWER
 
 
@@ -277,6 +278,46 @@ def evaluate(model, X, Y_scaled, y_scalers, device):
 
 
 # ---------------------------------------------------------------------------
+# Supervised pre-training (MSE warm-start)
+# ---------------------------------------------------------------------------
+
+def pretrain_supervised(model, X_tr, Y_tr, device, epochs=PRETRAIN_EPOCHS):
+    """
+    Warm-start the actor with plain MSE regression before PPO.
+
+    Optimises  L = MSE(sigmoid(actor_mean(h)), Y_scaled)  over the training set.
+    The critic and log_std are updated through the shared encoder gradient.
+    This avoids the cold-start problem where the policy starts in a degenerate
+    region (always-ON or always-OFF) before the reward signal is informative.
+    """
+    if epochs <= 0:
+        return
+    print(f"\n--- Supervised pre-training ({epochs} epochs) ---")
+    model.train()
+    opt = torch.optim.Adam(model.parameters(), lr=LR)
+    N = len(X_tr)
+    for ep in range(epochs):
+        perm = np.random.permutation(N)
+        total_loss = 0.0
+        n_batches  = 0
+        for start in range(0, N, BATCH):
+            idx = perm[start: start + BATCH]
+            xb  = torch.FloatTensor(X_tr[idx]).to(device)
+            yb  = torch.FloatTensor(Y_tr[idx]).to(device)
+            h    = model._encode(xb)
+            mean = torch.sigmoid(model.actor_mean(h))
+            loss = F.mse_loss(mean, yb)
+            opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+            opt.step()
+            total_loss += loss.item()
+            n_batches  += 1
+        print(f"  pretrain epoch {ep+1}/{epochs}  MSE={total_loss/n_batches:.6f}")
+    print("--- Pre-training complete ---\n")
+
+
+# ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
 
@@ -319,6 +360,9 @@ def train_model(data_splits, save_dir, hidden_size=64, dt=0.1):
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Parameters: {n_params:,}")
+
+    pretrain_supervised(model, X_tr, Y_tr, device, epochs=PRETRAIN_EPOCHS)
+
     print("Starting LNN-PPO training...\n")
 
     history = {
