@@ -110,6 +110,8 @@ def _aggregates(history, test_metrics):
         'val_f1_var':      float(np.var( [m['f1']  for m in vm])),
         'val_mae_mean':    float(np.mean([m['mae'] for m in vm])),
         'val_mae_var':     float(np.var( [m['mae'] for m in vm])),
+        'val_sae_mean':    float(np.mean([m['sae'] for m in vm])),
+        'val_sae_var':     float(np.var( [m['sae'] for m in vm])),
         'test_f1':         float(test_metrics['f1']),
         'test_mae':        float(test_metrics['mae']),
         'test_sae':        float(test_metrics['sae']),
@@ -197,7 +199,7 @@ def train_on_appliance(splits, appliance, dataset_dir=DEFAULT_DATASET_DIR,
     _, to, tt = _run_epoch(model, te_loader, criterion, optimizer, device, False)
     pre_ft_metrics = _metrics(ys.inverse_transform(tt).flatten(),
                                ys.inverse_transform(to).flatten())
-    print(f"  Test BEFORE fine-tune: F1={pre_ft_metrics['f1']:.4f}  MAE={pre_ft_metrics['mae']:.2f}")
+    print(f"  Test BEFORE fine-tune: F1={pre_ft_metrics['f1']:.4f}  MAE={pre_ft_metrics['mae']:.2f}  SAE={pre_ft_metrics['sae']:.4f}")
 
     # -- Phase 2: Fine-tune ---------------------------------------------------
     print("  Phase 2: Fine-tune")
@@ -223,27 +225,32 @@ def train_on_appliance(splits, appliance, dataset_dir=DEFAULT_DATASET_DIR,
     _, to, tt = _run_epoch(model, te_loader, criterion, ft_optimizer, device, False)
     test_metrics = _metrics(ys.inverse_transform(tt).flatten(),
                              ys.inverse_transform(to).flatten())
-    print(f"  Test AFTER  fine-tune: F1={test_metrics['f1']:.4f}  MAE={test_metrics['mae']:.2f}")
+    print(f"  Test AFTER  fine-tune: F1={test_metrics['f1']:.4f}  MAE={test_metrics['mae']:.2f}  SAE={test_metrics['sae']:.4f}")
 
     # -- Plot -----------------------------------------------------------------
     ep = range(1, len(history['train_loss']) + 1)
-    plt.figure(figsize=(15, 10))
-    plt.subplot(2,2,1)
+    plt.figure(figsize=(18, 10))
+    plt.subplot(2,3,1)
     plt.plot(ep, history['train_loss'], label='Train', color='blue')
     plt.plot(ep, history['val_loss'],   label='Val',   color='red')
     plt.title(f'Pretrain Loss - {appliance}'); plt.xlabel('Epoch')
     plt.legend(); plt.grid(alpha=0.3)
-    plt.subplot(2,2,2)
+    plt.subplot(2,3,2)
     plt.plot(ep, [m['mae'] for m in history['val_metrics']], color='red', label='Val MAE')
     plt.axhline(pre_ft_metrics['mae'],  color='steelblue',  linestyle='--', label='Test pre-FT')
     plt.axhline(test_metrics['mae'],    color='darkorange',  linestyle='--', label='Test post-FT')
     plt.title(f'MAE - {appliance}'); plt.xlabel('Epoch'); plt.legend(); plt.grid(alpha=0.3)
-    plt.subplot(2,2,3)
+    plt.subplot(2,3,3)
+    plt.plot(ep, [m['sae'] for m in history['val_metrics']], color='purple', label='Val SAE')
+    plt.axhline(pre_ft_metrics['sae'],  color='steelblue',  linestyle='--', label='Test pre-FT')
+    plt.axhline(test_metrics['sae'],    color='darkorange',  linestyle='--', label='Test post-FT')
+    plt.title(f'SAE - {appliance}'); plt.xlabel('Epoch'); plt.legend(); plt.grid(alpha=0.3)
+    plt.subplot(2,3,4)
     plt.plot(ep, [m['f1'] for m in history['val_metrics']], color='red', label='Val F1')
     plt.axhline(pre_ft_metrics['f1'],   color='steelblue',  linestyle='--', label='Test pre-FT')
     plt.axhline(test_metrics['f1'],     color='darkorange',  linestyle='--', label='Test post-FT')
     plt.title(f'F1 - {appliance}'); plt.xlabel('Epoch'); plt.legend(); plt.grid(alpha=0.3)
-    plt.subplot(2,2,4)
+    plt.subplot(2,3,5)
     ft_ep = range(1, len(ft_history['train_loss'])+1)
     plt.plot(ft_ep, ft_history['train_loss'], color='green', label='FT train loss')
     plt.title(f'Fine-tune Loss - {appliance}'); plt.xlabel('FT Epoch')
