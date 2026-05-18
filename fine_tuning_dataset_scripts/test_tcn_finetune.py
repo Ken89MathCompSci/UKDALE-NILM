@@ -176,7 +176,7 @@ def train_on_appliance(splits, appliance, dataset_dir=DEFAULT_DATASET_DIR,
         history['val_loss'].append(va_loss)
         history['val_metrics'].append(m)
         print(f"    Ep {epoch+1:3d}  train={tr_loss:.5f}  val={va_loss:.5f}  "
-              f"F1={m['f1']:.4f}  MAE={m['mae']:.2f}")
+              f"F1={m['f1']:.4f}  MAE={m['mae']:.2f}  SAE={m['sae']:.4f}")
         if va_loss < best_val:
             best_val = va_loss; counter = 0
             best_state = {k: v.clone() for k, v in model.state_dict().items()}
