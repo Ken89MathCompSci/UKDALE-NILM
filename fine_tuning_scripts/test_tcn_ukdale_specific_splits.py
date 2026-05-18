@@ -13,7 +13,7 @@ from sklearn.preprocessing import MinMaxScaler
 # Add Source Code to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'Source Code'))
 
-from models import LSTMLiquidNetworkModel
+from models import TCNModel
 from utils import calculate_nilm_metrics, save_model
 
 
@@ -39,18 +39,20 @@ def load_ukdale_specific_splits():
     with open('data/ukdale/test_small.pkl', 'rb') as f:
         test_data = pickle.load(f)[0]
 
+    print(f"Train data shape: {train_data.shape}")
+    print(f"Validation data shape: {val_data.shape}")
+    print(f"Test data shape: {test_data.shape}")
     print(f"Train date range: {train_data.index.min()} to {train_data.index.max()}")
-    print(f"Val   date range: {val_data.index.min()} to {val_data.index.max()}")
-    print(f"Test  date range: {test_data.index.min()} to {test_data.index.max()}")
+    print(f"Val date range: {val_data.index.min()} to {val_data.index.max()}")
+    print(f"Test date range: {test_data.index.min()} to {test_data.index.max()}")
 
     appliances = ['dish washer', 'fridge', 'microwave', 'washer dryer']
-    for app in appliances:
-        if app not in train_data.columns:
-            print(f"Warning: {app} not found in data columns")
+    for appliance in appliances:
+        if appliance not in train_data.columns:
+            print(f"Warning: {appliance} not found in data columns")
     print(f"Available columns: {list(train_data.columns)}")
 
-    return {'train': train_data, 'val': val_data, 'test': test_data,
-            'appliances': appliances}
+    return {'train': train_data, 'val': val_data, 'test': test_data, 'appliances': appliances}
 
 
 def create_sequences(data, window_size=100, target_size=1):
@@ -58,12 +60,12 @@ def create_sequences(data, window_size=100, target_size=1):
     X, y = [], []
     stride = 5
     for i in range(0, len(mains) - window_size - target_size + 1, stride):
-        X.append(mains[i:i + window_size])
+        X.append(mains[i:i+window_size])
         if target_size == 1:
             midpoint = i + window_size // 2
-            y.append(mains[midpoint:midpoint + 1])
+            y.append(mains[midpoint:midpoint+1])
         else:
-            y.append(mains[i + window_size:i + window_size + target_size])
+            y.append(mains[i+window_size:i+window_size+target_size])
     return np.array(X).reshape(-1, window_size, 1), np.array(y)
 
 
@@ -71,11 +73,12 @@ def get_threshold_for_appliance(appliance_name):
     return 0.5 if appliance_name == 'washer dryer' else 10.0
 
 
-def train_lstm_lnn_on_appliance(data_dict, appliance_name, window_size=100,
-                                 lstm_hidden=64, num_lstm_layers=2,
-                                 hidden_size=64, dropout=0.2, dt=0.1,
-                                 epochs=80, lr=0.001, patience=20,
-                                 save_dir='models/lstm_lnn_ukdale_specific'):
+def train_tcn_on_appliance(data_dict, appliance_name, window_size=100,
+                            num_channels=None, kernel_size=3, dropout=0.2,
+                            epochs=80, lr=0.001, patience=20,
+                            save_dir='models/tcn_ukdale_specific'):
+    if num_channels is None:
+        num_channels = [32, 64, 128]
 
     os.makedirs(save_dir, exist_ok=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -116,17 +119,15 @@ def train_lstm_lnn_on_appliance(data_dict, appliance_name, window_size=100,
     test_loader = torch.utils.data.DataLoader(
         UKDALEDataset(X_test, y_test), batch_size=32, shuffle=False)
 
-    input_size  = 1
+    input_size = 1
     output_size = 1
 
-    model = LSTMLiquidNetworkModel(
+    model = TCNModel(
         input_size=input_size,
-        hidden_size=hidden_size,
         output_size=output_size,
-        lstm_hidden=lstm_hidden,
-        num_lstm_layers=num_lstm_layers,
-        dropout=dropout,
-        dt=dt
+        num_channels=num_channels,
+        kernel_size=kernel_size,
+        dropout=dropout
     ).to(device)
 
     criterion = torch.nn.MSELoss()
@@ -138,7 +139,7 @@ def train_lstm_lnn_on_appliance(data_dict, appliance_name, window_size=100,
     best_val_loss = float('inf')
     counter = 0
 
-    print(f"Starting LSTM-LNN training for {appliance_name}...")
+    print(f"Starting TCN training for {appliance_name}...")
 
     for epoch in range(epochs):
         model.train()
@@ -190,11 +191,11 @@ def train_lstm_lnn_on_appliance(data_dict, appliance_name, window_size=100,
             best_val_loss = avg_val_loss
             counter = 0
             best_model_path = os.path.join(
-                save_dir, f"lstm_lnn_ukdale_{appliance_name.replace(' ', '_')}_best.pth")
+                save_dir, f"tcn_ukdale_{appliance_name.replace(' ', '_')}_best.pth")
             save_model(model,
                        {'input_size': input_size, 'output_size': output_size,
-                        'lstm_hidden': lstm_hidden, 'num_lstm_layers': num_lstm_layers,
-                        'hidden_size': hidden_size, 'dropout': dropout, 'dt': dt},
+                        'num_channels': num_channels, 'kernel_size': kernel_size,
+                        'dropout': dropout},
                        {'lr': lr, 'epochs': epochs, 'patience': patience,
                         'window_size': window_size, 'appliance': appliance_name},
                        metrics, best_model_path)
@@ -293,7 +294,7 @@ def train_lstm_lnn_on_appliance(data_dict, appliance_name, window_size=100,
 
     plt.tight_layout()
     plt.savefig(os.path.join(save_dir,
-        f"lstm_lnn_ukdale_{appliance_name.replace(' ', '_')}_metrics.png"),
+        f"tcn_ukdale_{appliance_name.replace(' ', '_')}_metrics.png"),
         dpi=300, bbox_inches='tight')
     plt.close()
 
@@ -303,8 +304,7 @@ def train_lstm_lnn_on_appliance(data_dict, appliance_name, window_size=100,
         'window_size': window_size,
         'model_params': {
             'input_size': input_size, 'output_size': output_size,
-            'lstm_hidden': lstm_hidden, 'num_lstm_layers': num_lstm_layers,
-            'hidden_size': hidden_size, 'dropout': dropout, 'dt': dt
+            'num_channels': num_channels, 'kernel_size': kernel_size, 'dropout': dropout
         },
         'train_params': {'lr': lr, 'epochs': epochs, 'patience': patience},
         'final_metrics': {
@@ -316,48 +316,47 @@ def train_lstm_lnn_on_appliance(data_dict, appliance_name, window_size=100,
         }
     }
     with open(os.path.join(save_dir,
-            f'lstm_lnn_ukdale_{appliance_name.replace(" ", "_")}_history.json'),
+            f'tcn_ukdale_{appliance_name.replace(" ", "_")}_history.json'),
             'w', encoding='utf-8') as f:
         json.dump(config, f, indent=4)
 
     return model, history, test_metrics
 
 
-def test_lstm_lnn_on_all_ukdale_appliances(window_size=100, lstm_hidden=64,
-                                            num_lstm_layers=2, hidden_size=64,
-                                            dropout=0.2, dt=0.1,
-                                            epochs=80, lr=0.001, patience=20):
+def test_tcn_on_all_ukdale_appliances(window_size=100, num_channels=None, kernel_size=3,
+                                      dropout=0.2, epochs=80, lr=0.001, patience=20):
+    if num_channels is None:
+        num_channels = [32, 64, 128]
 
     data_dict = load_ukdale_specific_splits()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base_save_dir = f"models/lstm_lnn_ukdale_specific_test_{timestamp}"
+    base_save_dir = f"models/tcn_ukdale_specific_test_{timestamp}"
 
     all_results = {}
     appliances = ['dish washer', 'fridge', 'microwave', 'washer dryer']
 
     for appliance_name in appliances:
         print(f"\n{'='*60}")
-        print(f"Testing LSTM-LNN on {appliance_name}")
+        print(f"Testing TCN on {appliance_name}")
         print(f"{'='*60}\n")
 
         appliance_dir = os.path.join(base_save_dir, appliance_name.replace(' ', '_'))
         os.makedirs(appliance_dir, exist_ok=True)
 
         try:
-            model, history, test_metrics = train_lstm_lnn_on_appliance(
+            model, history, test_metrics = train_tcn_on_appliance(
                 data_dict, appliance_name=appliance_name,
-                window_size=window_size, lstm_hidden=lstm_hidden,
-                num_lstm_layers=num_lstm_layers, hidden_size=hidden_size,
-                dropout=dropout, dt=dt,
+                window_size=window_size, num_channels=num_channels,
+                kernel_size=kernel_size, dropout=dropout,
                 epochs=epochs, lr=lr, patience=patience, save_dir=appliance_dir)
             if model is not None:
                 all_results[appliance_name] = {
                     'model_path': os.path.join(
                         appliance_dir,
-                        f"lstm_lnn_ukdale_{appliance_name.replace(' ', '_')}_best.pth"),
+                        f"tcn_ukdale_{appliance_name.replace(' ', '_')}_best.pth"),
                     'final_metrics': {k: float(v) for k, v in test_metrics.items()}
                 }
-                print(f"Successfully tested LSTM-LNN on {appliance_name}")
+                print(f"Successfully tested TCN on {appliance_name}")
         except Exception as e:
             print(f"Error on {appliance_name}: {str(e)}")
             import traceback
@@ -372,22 +371,19 @@ def test_lstm_lnn_on_all_ukdale_appliances(window_size=100, lstm_hidden=64,
             'testing':    {'house': 5, 'date': '2014-08-24'}
         },
         'window_size': window_size,
-        'model_params': {
-            'lstm_hidden': lstm_hidden, 'num_lstm_layers': num_lstm_layers,
-            'hidden_size': hidden_size, 'dropout': dropout, 'dt': dt
-        },
+        'model_params': {'num_channels': num_channels, 'kernel_size': kernel_size, 'dropout': dropout},
         'train_params': {'epochs': epochs, 'lr': lr, 'patience': patience},
         'results': all_results
     }
     with open(os.path.join(base_save_dir, 'summary.json'), 'w', encoding='utf-8') as f:
         json.dump(summary, f, indent=4)
 
-    print(f"\nLSTM-LNN UKDALE testing completed. Results saved to {base_save_dir}")
+    print(f"\nTCN UKDALE testing completed. Results saved to {base_save_dir}")
     return all_results
 
 
 if __name__ == "__main__":
-    print("Testing LSTM-LNN on UKDALE dataset with specific splits...")
+    print("Testing TCN on UKDALE dataset with specific splits...")
 
     required_files = [
         'data/ukdale/train_small.pkl',
@@ -399,19 +395,11 @@ if __name__ == "__main__":
             print(f"Error: {file_path} not found!")
             sys.exit(1)
 
-    results = test_lstm_lnn_on_all_ukdale_appliances(
-        window_size=100,
-        lstm_hidden=64,
-        num_lstm_layers=2,
-        hidden_size=64,
-        dropout=0.2,
-        dt=0.1,
-        epochs=80,
-        lr=0.001,
-        patience=20
-    )
+    results = test_tcn_on_all_ukdale_appliances(
+        window_size=100, num_channels=[32, 64, 128], kernel_size=3,
+        dropout=0.2, epochs=80, lr=0.001, patience=20)
 
-    print(f"\nSummary of LSTM-LNN testing on UKDALE dataset:")
+    print(f"\nSummary of TCN testing on UKDALE dataset:")
     print(f"Total appliances tested: {len(results)}")
     for appliance, result in results.items():
         print(f"  {appliance}:")

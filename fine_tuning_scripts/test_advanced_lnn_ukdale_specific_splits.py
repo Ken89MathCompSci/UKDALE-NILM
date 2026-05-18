@@ -7,14 +7,13 @@ import json
 from datetime import datetime
 from tqdm import tqdm
 import pickle
-import pandas as pd
 from sklearn.preprocessing import MinMaxScaler
 
-# Add Source Code to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'Source Code'))
 
-from models import TCNLiquidNetworkModel
+from models import AdvancedLiquidNetworkModel
 from utils import calculate_nilm_metrics, save_model
+
 
 class UKDALEDataset(torch.utils.data.Dataset):
     def __init__(self, X, y):
@@ -29,16 +28,6 @@ class UKDALEDataset(torch.utils.data.Dataset):
 
 
 def load_ukdale_specific_splits():
-    """
-    Load UKDALE data with specific splits:
-
-    Dataset  House  Time Start                Time End
-    Train    1      2013-03-17 19:12:42       2013-03-18 19:12:36
-    Val      1      2013-04-17 00:00:00       2013-04-17 23:59:54
-    Test     5      2014-06-29 16:23:48       2014-06-30 16:23:42
-
-    Appliances: dish washer, fridge, microwave, washer dryer
-    """
     print("Loading UKDALE data with specific splits...")
 
     with open('data/ukdale/train_small.pkl', 'rb') as f:
@@ -54,67 +43,28 @@ def load_ukdale_specific_splits():
     print(f"Train date range: {train_data.index.min()} to {train_data.index.max()}")
     print(f"Val date range: {val_data.index.min()} to {val_data.index.max()}")
     print(f"Test date range: {test_data.index.min()} to {test_data.index.max()}")
-
-    appliances = ['dish washer', 'fridge', 'microwave', 'washer dryer']
-    for appliance in appliances:
-        if appliance not in train_data.columns:
-            print(f"Warning: {appliance} not found in data columns")
-
     print(f"Available columns: {list(train_data.columns)}")
 
-    return {
-        'train': train_data,
-        'val': val_data,
-        'test': test_data,
-        'appliances': appliances
-    }
+    return {'train': train_data, 'val': val_data, 'test': test_data}
 
 
-def create_sequences(data, window_size=100, target_size=1):
-    """
-    Create sequences for sequence-to-point prediction.
-
-    Args:
-        data: DataFrame with 'main' and appliance columns
-        window_size: Size of input window
-        target_size: Size of target (1 for sequence-to-point)
-
-    Returns:
-        X: Input sequences (n_samples, window_size, 1)
-        y: Target values (n_samples, target_size)
-    """
+def create_sequences(data, window_size=100):
     mains = data['main'].values
-    X, y = [], []
-
+    X = []
     stride = 5
-
-    for i in range(0, len(mains) - window_size - target_size + 1, stride):
+    for i in range(0, len(mains) - window_size + 1, stride):
         X.append(mains[i:i+window_size])
-
-        if target_size == 1:
-            midpoint = i + window_size // 2
-            y.append(mains[midpoint:midpoint+1])
-        else:
-            y.append(mains[i+window_size:i+window_size+target_size])
-
-    return np.array(X).reshape(-1, window_size, 1), np.array(y)
+    return np.array(X).reshape(-1, window_size, 1)
 
 
 def get_threshold_for_appliance(appliance_name):
-    if appliance_name == 'washer dryer':
-        return 0.5
-    else:
-        return 10.0
+    return 0.5 if appliance_name == 'washer dryer' else 10.0
 
 
-def train_tcn_lnn_on_appliance(data_dict, appliance_name, window_size=100,
-                                num_channels=None, kernel_size=3, dropout=0.2,
-                                hidden_size=64, dt=0.1,
-                                epochs=80, lr=0.001, patience=20,
-                                save_dir='models/tcn_lnn_ukdale_specific'):
-    if num_channels is None:
-        num_channels = [32, 64, 128]
-
+def train_on_appliance(data_dict, appliance_name, window_size=100,
+                       hidden_size=64, num_layers=2, dt=0.1,
+                       epochs=80, lr=0.001, patience=20,
+                       save_dir='models/advanced_lnn_ukdale_specific'):
     os.makedirs(save_dir, exist_ok=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -124,16 +74,14 @@ def train_tcn_lnn_on_appliance(data_dict, appliance_name, window_size=100,
     test_data  = data_dict['test']
 
     print(f"Creating sequences for {appliance_name}...")
-    X_train, y_train = create_sequences(train_data, window_size=window_size, target_size=1)
-    X_val,   y_val   = create_sequences(val_data,   window_size=window_size, target_size=1)
-    X_test,  y_test  = create_sequences(test_data,  window_size=window_size, target_size=1)
+    X_train = create_sequences(train_data, window_size)
+    X_val   = create_sequences(val_data,   window_size)
+    X_test  = create_sequences(test_data,  window_size)
 
-    # Use appliance power as target
     y_train = train_data[appliance_name].iloc[::5].values.reshape(-1, 1)[:len(X_train)]
     y_val   = val_data[appliance_name].iloc[::5].values.reshape(-1, 1)[:len(X_val)]
     y_test  = test_data[appliance_name].iloc[::5].values.reshape(-1, 1)[:len(X_test)]
 
-    # Normalise to [0, 1]
     x_scaler = MinMaxScaler()
     y_scaler = MinMaxScaler()
 
@@ -156,17 +104,12 @@ def train_tcn_lnn_on_appliance(data_dict, appliance_name, window_size=100,
     test_loader = torch.utils.data.DataLoader(
         UKDALEDataset(X_test, y_test), batch_size=32, shuffle=False)
 
-    input_size  = 1
-    output_size = 1
-
-    model = TCNLiquidNetworkModel(
-        input_size=input_size,
+    model = AdvancedLiquidNetworkModel(
+        input_size=1,
         hidden_size=hidden_size,
-        output_size=output_size,
-        dt=dt,
-        num_channels=num_channels,
-        kernel_size=kernel_size,
-        dropout=dropout
+        output_size=1,
+        num_layers=num_layers,
+        dt=dt
     ).to(device)
 
     criterion = torch.nn.MSELoss()
@@ -178,10 +121,9 @@ def train_tcn_lnn_on_appliance(data_dict, appliance_name, window_size=100,
     best_val_loss = float('inf')
     counter = 0
 
-    print(f"Starting TCN-LNN training for {appliance_name}...")
+    print(f"Starting Advanced-LNN training for {appliance_name}...")
 
     for epoch in range(epochs):
-        # Training
         model.train()
         train_loss = 0.0
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
@@ -199,7 +141,6 @@ def train_tcn_lnn_on_appliance(data_dict, appliance_name, window_size=100,
         avg_train_loss = train_loss / len(train_loader)
         history['train_loss'].append(avg_train_loss)
 
-        # Validation
         model.eval()
         val_loss = 0.0
         all_targets, all_outputs = [], []
@@ -232,11 +173,10 @@ def train_tcn_lnn_on_appliance(data_dict, appliance_name, window_size=100,
             best_val_loss = avg_val_loss
             counter = 0
             best_model_path = os.path.join(
-                save_dir, f"tcn_lnn_ukdale_{appliance_name.replace(' ', '_')}_best.pth")
+                save_dir, f"advanced_lnn_ukdale_{appliance_name.replace(' ', '_')}_best.pth")
             save_model(model,
-                       {'input_size': input_size, 'output_size': output_size,
-                        'num_channels': num_channels, 'kernel_size': kernel_size,
-                        'dropout': dropout},
+                       {'input_size': 1, 'output_size': 1,
+                        'hidden_size': hidden_size, 'num_layers': num_layers, 'dt': dt},
                        {'lr': lr, 'epochs': epochs, 'patience': patience,
                         'window_size': window_size, 'appliance': appliance_name},
                        metrics, best_model_path)
@@ -250,7 +190,6 @@ def train_tcn_lnn_on_appliance(data_dict, appliance_name, window_size=100,
 
     print("Training completed!")
 
-    # Test evaluation
     print("Evaluating on test set...")
     model.eval()
     test_loss = 0.0
@@ -305,7 +244,6 @@ def train_tcn_lnn_on_appliance(data_dict, appliance_name, window_size=100,
     print("Aggregates (mean/variance):")
     print(json.dumps(aggregates, indent=2))
 
-    # Plots
     plt.figure(figsize=(15, 10))
 
     plt.subplot(2, 2, 1)
@@ -338,19 +276,17 @@ def train_tcn_lnn_on_appliance(data_dict, appliance_name, window_size=100,
 
     plt.tight_layout()
     plt.savefig(os.path.join(save_dir,
-        f"tcn_lnn_ukdale_{appliance_name.replace(' ', '_')}_metrics.png"),
+        f"advanced_lnn_ukdale_{appliance_name.replace(' ', '_')}_metrics.png"),
         dpi=300, bbox_inches='tight')
     plt.close()
 
-    # Save config/history
     config = {
         'appliance': appliance_name,
         'dataset': 'UKDALE',
         'window_size': window_size,
         'model_params': {
-            'input_size': input_size, 'output_size': output_size,
-            'num_channels': num_channels, 'kernel_size': kernel_size,
-            'dropout': dropout, 'hidden_size': hidden_size
+            'input_size': 1, 'output_size': 1,
+            'hidden_size': hidden_size, 'num_layers': num_layers, 'dt': dt
         },
         'train_params': {'lr': lr, 'epochs': epochs, 'patience': patience},
         'final_metrics': {
@@ -362,43 +298,37 @@ def train_tcn_lnn_on_appliance(data_dict, appliance_name, window_size=100,
         }
     }
     with open(os.path.join(save_dir,
-            f'tcn_lnn_ukdale_{appliance_name.replace(" ", "_")}_history.json'),
+            f'advanced_lnn_ukdale_{appliance_name.replace(" ", "_")}_history.json'),
             'w', encoding='utf-8') as f:
         json.dump(config, f, indent=4)
 
     return model, history, test_metrics
 
 
-def test_tcn_lnn_on_all_ukdale_appliances(window_size=100, num_channels=None, kernel_size=3,
-                                          dropout=0.2, hidden_size=64, dt=0.1,
-                                          epochs=80, lr=0.001, patience=20):
-    if num_channels is None:
-        num_channels = [32, 64, 128]
-
+def test_on_all_appliances(window_size=100, hidden_size=64, num_layers=2, dt=0.1,
+                           epochs=80, lr=0.001, patience=20):
     data_dict = load_ukdale_specific_splits()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base_save_dir = f"models/tcn_lnn_ukdale_specific_test_{timestamp}"
+    base_save_dir = f"models/advanced_lnn_ukdale_specific_test_{timestamp}"
 
     all_results = {}
     appliances = ['dish washer', 'fridge', 'microwave', 'washer dryer']
 
     for appliance_name in appliances:
         print(f"\n{'='*60}")
-        print(f"Testing TCN-LNN on {appliance_name}")
+        print(f"Testing Advanced-LNN on {appliance_name}")
         print(f"{'='*60}\n")
 
         appliance_dir = os.path.join(base_save_dir, appliance_name.replace(' ', '_'))
         os.makedirs(appliance_dir, exist_ok=True)
 
         try:
-            model, history, test_metrics = train_tcn_lnn_on_appliance(
+            model, history, test_metrics = train_on_appliance(
                 data_dict,
                 appliance_name=appliance_name,
                 window_size=window_size,
-                num_channels=num_channels,
-                kernel_size=kernel_size,
-                dropout=dropout,
                 hidden_size=hidden_size,
+                num_layers=num_layers,
                 dt=dt,
                 epochs=epochs,
                 lr=lr,
@@ -409,10 +339,9 @@ def test_tcn_lnn_on_all_ukdale_appliances(window_size=100, num_channels=None, ke
                 all_results[appliance_name] = {
                     'model_path': os.path.join(
                         appliance_dir,
-                        f"tcn_lnn_ukdale_{appliance_name.replace(' ', '_')}_best.pth"),
+                        f"advanced_lnn_ukdale_{appliance_name.replace(' ', '_')}_best.pth"),
                     'final_metrics': {k: float(v) for k, v in test_metrics.items()}
                 }
-                print(f"Successfully tested TCN-LNN on {appliance_name}")
         except Exception as e:
             print(f"Error on {appliance_name}: {str(e)}")
             import traceback
@@ -422,15 +351,12 @@ def test_tcn_lnn_on_all_ukdale_appliances(window_size=100, num_channels=None, ke
         'timestamp': timestamp,
         'dataset': 'UKDALE',
         'dataset_splits': {
-            'training':   {'house': 1, 'time_start': '2013-03-17 19:12:42', 'time_end': '2013-03-18 19:12:36'},
-            'validation': {'house': 1, 'time_start': '2013-04-17 00:00:00', 'time_end': '2013-04-17 23:59:54'},
-            'testing':    {'house': 5, 'time_start': '2014-06-29 16:23:48', 'time_end': '2014-06-30 16:23:42'}
+            'training':   {'house': 1, 'date': '2014-11-09'},
+            'validation': {'house': 1, 'date': '2014-12-07'},
+            'testing':    {'house': 5, 'date': '2014-08-24'}
         },
         'window_size': window_size,
-        'model_params': {
-            'num_channels': num_channels, 'kernel_size': kernel_size,
-            'dropout': dropout, 'hidden_size': hidden_size
-        },
+        'model_params': {'hidden_size': hidden_size, 'num_layers': num_layers, 'dt': dt},
         'train_params': {'epochs': epochs, 'lr': lr, 'patience': patience},
         'results': all_results
     }
@@ -438,36 +364,29 @@ def test_tcn_lnn_on_all_ukdale_appliances(window_size=100, num_channels=None, ke
     with open(os.path.join(base_save_dir, 'summary.json'), 'w', encoding='utf-8') as f:
         json.dump(summary, f, indent=4)
 
-    print(f"\nTCN-LNN UKDALE testing completed. Results saved to {base_save_dir}")
+    print(f"\nAdvanced-LNN UKDALE testing completed. Results saved to {base_save_dir}")
     return all_results
 
 
 if __name__ == "__main__":
-    print("Testing TCN-LNN on UKDALE dataset with specific splits...")
+    print("Testing Advanced-LNN on UKDALE dataset with specific splits...")
 
-    required_files = [
-        'data/ukdale/train_small.pkl',
-        'data/ukdale/val_small.pkl',
-        'data/ukdale/test_small.pkl'
-    ]
-    for file_path in required_files:
-        if not os.path.exists(file_path):
-            print(f"Error: {file_path} not found!")
+    for f in ['data/ukdale/train_small.pkl', 'data/ukdale/val_small.pkl', 'data/ukdale/test_small.pkl']:
+        if not os.path.exists(f):
+            print(f"Error: {f} not found!")
             sys.exit(1)
 
-    results = test_tcn_lnn_on_all_ukdale_appliances(
+    results = test_on_all_appliances(
         window_size=100,
-        num_channels=[32, 64, 128],
-        kernel_size=3,
-        dropout=0.2,
         hidden_size=64,
+        num_layers=2,
         dt=0.1,
         epochs=80,
         lr=0.001,
         patience=20
     )
 
-    print(f"\nSummary of TCN-LNN testing on UKDALE dataset:")
+    print(f"\nSummary of Advanced-LNN testing on UKDALE dataset:")
     print(f"Total appliances tested: {len(results)}")
     for appliance, result in results.items():
         print(f"  {appliance}:")

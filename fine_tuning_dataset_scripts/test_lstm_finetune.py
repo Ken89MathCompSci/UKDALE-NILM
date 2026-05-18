@@ -1,10 +1,10 @@
 """
-LSTM-LNN — Cross-House Fine-Tuning on fine_tuning_dataset/
+LSTM -- Cross-House Fine-Tuning on fine_tuning_dataset/
 
 Three-phase strategy (per appliance):
-    Phase 1 — Pretrain : House 1 data (pretrain.csv), validate on validation.csv
-    Phase 2 — Fine-tune: House 5 first 2h (finetune.csv), low LR adaptation
-    Phase 3 — Test     : House 5 remaining 22h (test.csv)
+    Phase 1 - Pretrain : House 1 data (pretrain.csv), validate on validation.csv
+    Phase 2 - Fine-tune: House 5 first 2h (finetune.csv), low LR adaptation
+    Phase 3 - Test     : House 5 remaining 22h (test.csv)
 
 Reports test metrics before and after fine-tuning.
 """
@@ -16,12 +16,11 @@ import numpy as np
 import matplotlib.pyplot as plt
 import json
 from datetime import datetime
-from tqdm import tqdm
 import pandas as pd
 from sklearn.preprocessing import MinMaxScaler
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'Source Code'))
-from models import LSTMLiquidNetworkModel
+from models import LSTMModel
 from utils import calculate_nilm_metrics, save_model
 
 
@@ -46,7 +45,7 @@ class UKDALEDataset(torch.utils.data.Dataset):
     def __init__(self, X, y):
         self.X = torch.FloatTensor(X)
         self.y = torch.FloatTensor(y)
-    def __len__(self):          return len(self.X)
+    def __len__(self):         return len(self.X)
     def __getitem__(self, idx): return self.X[idx], self.y[idx]
 
 
@@ -124,8 +123,8 @@ def _aggregates(history, test_metrics):
 # ---------------------------------------------------------------------------
 
 def train_on_appliance(splits, appliance, dataset_dir=DEFAULT_DATASET_DIR,
-                       lstm_hidden=64, num_lstm_layers=2, hidden_size=64,
-                       dropout=0.2, dt=0.1, save_dir='models/lstm_lnn_finetune'):
+                       hidden_size=64, num_layers=2, dropout=0.2,
+                       save_dir='models/lstm_finetune'):
 
     os.makedirs(save_dir, exist_ok=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -151,19 +150,17 @@ def train_on_appliance(splits, appliance, dataset_dir=DEFAULT_DATASET_DIR,
     ft_loader  = mk_loader(X_ft,  y_ft,  True)
     te_loader  = mk_loader(X_te,  y_te,  False)
 
-    model = LSTMLiquidNetworkModel(
-        input_size=1, hidden_size=hidden_size, output_size=1,
-        lstm_hidden=lstm_hidden, num_lstm_layers=num_lstm_layers,
-        dropout=dropout, dt=dt).to(device)
+    model = LSTMModel(input_size=1, hidden_size=hidden_size, num_layers=num_layers,
+                      output_size=1, dropout=dropout).to(device)
     criterion = torch.nn.MSELoss()
 
-    # ── Phase 1: Pretrain ──────────────────────────────────────────────────
+    # -- Phase 1: Pretrain ----------------------------------------------------
     print("  Phase 1: Pretrain")
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.5, patience=3)
     history = {'train_loss': [], 'val_loss': [], 'val_metrics': []}
-    best_val = float('inf'); best_state = None; counter = 0
+    best_val  = float('inf'); best_state = None; counter = 0
 
     for epoch in range(EPOCHS):
         tr_loss, _, _   = _run_epoch(model, pre_loader, criterion, optimizer, device, True)
@@ -179,9 +176,8 @@ def train_on_appliance(splits, appliance, dataset_dir=DEFAULT_DATASET_DIR,
             best_val = va_loss; counter = 0
             best_state = {k: v.clone() for k, v in model.state_dict().items()}
             save_model(model,
-                       {'input_size':1,'output_size':1,'lstm_hidden':lstm_hidden,
-                        'num_lstm_layers':num_lstm_layers,'hidden_size':hidden_size,
-                        'dropout':dropout,'dt':dt},
+                       {'input_size':1,'output_size':1,'hidden_size':hidden_size,
+                        'num_layers':num_layers,'dropout':dropout},
                        {'lr':LR,'epochs':EPOCHS,'patience':PATIENCE,'appliance':appliance},
                        m, os.path.join(save_dir, f'pretrain_{appliance}_best.pth'))
         else:
@@ -196,7 +192,7 @@ def train_on_appliance(splits, appliance, dataset_dir=DEFAULT_DATASET_DIR,
                                ys.inverse_transform(to).flatten())
     print(f"  Test BEFORE fine-tune: F1={pre_ft_metrics['f1']:.4f}  MAE={pre_ft_metrics['mae']:.2f}")
 
-    # ── Phase 2: Fine-tune ─────────────────────────────────────────────────
+    # -- Phase 2: Fine-tune ---------------------------------------------------
     print("  Phase 2: Fine-tune")
     ft_optimizer = torch.optim.Adam(model.parameters(), lr=LR_FT)
     best_ft = float('inf'); best_ft_state = None; ft_counter = 0
@@ -216,12 +212,13 @@ def train_on_appliance(splits, appliance, dataset_dir=DEFAULT_DATASET_DIR,
 
     model.load_state_dict(best_ft_state)
 
+    # -- Phase 3: Test --------------------------------------------------------
     _, to, tt = _run_epoch(model, te_loader, criterion, ft_optimizer, device, False)
     test_metrics = _metrics(ys.inverse_transform(tt).flatten(),
                              ys.inverse_transform(to).flatten())
     print(f"  Test AFTER  fine-tune: F1={test_metrics['f1']:.4f}  MAE={test_metrics['mae']:.2f}")
 
-    # ── Plot ───────────────────────────────────────────────────────────────
+    # -- Plot -----------------------------------------------------------------
     ep = range(1, len(history['train_loss']) + 1)
     plt.figure(figsize=(15, 10))
     plt.subplot(2,2,1)
@@ -232,12 +229,12 @@ def train_on_appliance(splits, appliance, dataset_dir=DEFAULT_DATASET_DIR,
     plt.subplot(2,2,2)
     plt.plot(ep, [m['mae'] for m in history['val_metrics']], color='red', label='Val MAE')
     plt.axhline(pre_ft_metrics['mae'], color='steelblue',  linestyle='--', label='Test pre-FT')
-    plt.axhline(test_metrics['mae'],   color='darkorange',  linestyle='--', label='Test post-FT')
+    plt.axhline(test_metrics['mae'],   color='darkorange', linestyle='--', label='Test post-FT')
     plt.title(f'MAE - {appliance}'); plt.xlabel('Epoch'); plt.legend(); plt.grid(alpha=0.3)
     plt.subplot(2,2,3)
     plt.plot(ep, [m['f1'] for m in history['val_metrics']], color='red', label='Val F1')
-    plt.axhline(pre_ft_metrics['f1'],  color='steelblue',  linestyle='--', label='Test pre-FT')
-    plt.axhline(test_metrics['f1'],    color='darkorange',  linestyle='--', label='Test post-FT')
+    plt.axhline(pre_ft_metrics['f1'], color='steelblue',  linestyle='--', label='Test pre-FT')
+    plt.axhline(test_metrics['f1'],   color='darkorange', linestyle='--', label='Test post-FT')
     plt.title(f'F1 - {appliance}'); plt.xlabel('Epoch'); plt.legend(); plt.grid(alpha=0.3)
     plt.subplot(2,2,4)
     ft_ep = range(1, len(ft_history['train_loss'])+1)
@@ -245,21 +242,20 @@ def train_on_appliance(splits, appliance, dataset_dir=DEFAULT_DATASET_DIR,
     plt.title(f'Fine-tune Loss - {appliance}'); plt.xlabel('FT Epoch')
     plt.legend(); plt.grid(alpha=0.3)
     plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, f'lstm_lnn_{appliance}_metrics.png'),
-                dpi=150, bbox_inches='tight')
+    plt.savefig(os.path.join(save_dir, f'lstm_{appliance}_metrics.png'), dpi=150, bbox_inches='tight')
     plt.close()
 
+    # -- JSON -----------------------------------------------------------------
     config = {
-        'appliance': appliance, 'dataset': 'fine_tuning_dataset', 'model': 'LSTM-LNN',
-        'model_params': {'lstm_hidden':lstm_hidden,'num_lstm_layers':num_lstm_layers,
-                         'hidden_size':hidden_size,'dropout':dropout,'dt':dt},
+        'appliance': appliance, 'dataset': 'fine_tuning_dataset', 'model': 'LSTM',
+        'model_params': {'hidden_size':hidden_size,'num_layers':num_layers,'dropout':dropout},
         'pretrain_params': {'lr':LR,'epochs':EPOCHS,'patience':PATIENCE},
         'finetune_params': {'lr':LR_FT,'epochs':EPOCHS_FT,'patience':PATIENCE_FT},
         'test_metrics_before_finetune': {k: float(v) for k,v in pre_ft_metrics.items()},
         'test_metrics_after_finetune':  {k: float(v) for k,v in test_metrics.items()},
         'aggregates': _aggregates(history, test_metrics),
     }
-    with open(os.path.join(save_dir, f'lstm_lnn_{appliance}_results.json'),
+    with open(os.path.join(save_dir, f'lstm_{appliance}_results.json'),
               'w', encoding='utf-8') as f:
         json.dump(config, f, indent=4)
 
@@ -270,22 +266,21 @@ def train_on_appliance(splits, appliance, dataset_dir=DEFAULT_DATASET_DIR,
 # Run all appliances
 # ---------------------------------------------------------------------------
 
-def run_all(dataset_dir=DEFAULT_DATASET_DIR, lstm_hidden=64, num_lstm_layers=2,
-            hidden_size=64, dropout=0.2, dt=0.1):
+def run_all(dataset_dir=DEFAULT_DATASET_DIR, hidden_size=64, num_layers=2, dropout=0.2):
     print("Loading fine_tuning_dataset splits...")
     splits    = load_splits(dataset_dir)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base_dir  = f"models/lstm_lnn_finetune_{timestamp}"
+    base_dir  = f"models/lstm_finetune_{timestamp}"
     all_results = {}
 
     for app in APPLIANCES:
-        print(f"\n{'='*60}\nLSTM-LNN — {app}\n{'='*60}")
+        print(f"\n{'='*60}\nLSTM -- {app}\n{'='*60}")
         app_dir = os.path.join(base_dir, app)
         try:
             _, _, after, before = train_on_appliance(
                 splits, app, dataset_dir=dataset_dir,
-                lstm_hidden=lstm_hidden, num_lstm_layers=num_lstm_layers,
-                hidden_size=hidden_size, dropout=dropout, dt=dt, save_dir=app_dir)
+                hidden_size=hidden_size, num_layers=num_layers,
+                dropout=dropout, save_dir=app_dir)
             all_results[app] = {
                 'before_finetune': {k: float(v) for k,v in before.items()},
                 'after_finetune':  {k: float(v) for k,v in after.items()},
@@ -294,22 +289,21 @@ def run_all(dataset_dir=DEFAULT_DATASET_DIR, lstm_hidden=64, num_lstm_layers=2,
             print(f"Error on {app}: {e}"); import traceback; traceback.print_exc()
 
     summary = {
-        'timestamp': timestamp, 'model': 'LSTM-LNN', 'dataset': 'fine_tuning_dataset',
+        'timestamp': timestamp, 'model': 'LSTM', 'dataset': 'fine_tuning_dataset',
         'dataset_splits': {
             'pretrain':   {'house': 1, 'dates': 'Nov-09 + Dec-07 2014'},
             'validation': {'house': 1, 'dates': 'Dec-07 2014'},
             'finetune':   {'house': 5, 'dates': 'Aug-24 2014 first 2h'},
             'test':       {'house': 5, 'dates': 'Aug-24 2014 remaining 22h'},
         },
-        'model_params': {'lstm_hidden':lstm_hidden,'num_lstm_layers':num_lstm_layers,
-                         'hidden_size':hidden_size,'dropout':dropout,'dt':dt},
+        'model_params': {'hidden_size':hidden_size,'num_layers':num_layers,'dropout':dropout},
         'results': all_results,
     }
     os.makedirs(base_dir, exist_ok=True)
     with open(os.path.join(base_dir, 'summary.json'), 'w', encoding='utf-8') as f:
         json.dump(summary, f, indent=4)
 
-    print(f"\nLSTM-LNN fine-tuning complete. Results saved to {base_dir}")
+    print(f"\nLSTM fine-tuning complete. Results saved to {base_dir}")
     for app, r in all_results.items():
         print(f"  {app:<20} F1 {r['before_finetune']['f1']:.4f} -> {r['after_finetune']['f1']:.4f}  "
               f"MAE {r['before_finetune']['mae']:.1f} -> {r['after_finetune']['mae']:.1f}")
@@ -319,11 +313,9 @@ def run_all(dataset_dir=DEFAULT_DATASET_DIR, lstm_hidden=64, num_lstm_layers=2,
 if __name__ == '__main__':
     import argparse
     p = argparse.ArgumentParser()
-    p.add_argument('--dataset-dir',      default=DEFAULT_DATASET_DIR)
-    p.add_argument('--lstm-hidden',      type=int,   default=64)
-    p.add_argument('--num-lstm-layers',  type=int,   default=2)
-    p.add_argument('--hidden-size',      type=int,   default=64)
-    p.add_argument('--dt',               type=float, default=0.1)
+    p.add_argument('--dataset-dir', default=DEFAULT_DATASET_DIR)
+    p.add_argument('--hidden-size', type=int,   default=64)
+    p.add_argument('--num-layers',  type=int,   default=2)
+    p.add_argument('--dropout',     type=float, default=0.2)
     args = p.parse_args()
-    run_all(args.dataset_dir, args.lstm_hidden, args.num_lstm_layers,
-            args.hidden_size, dt=args.dt)
+    run_all(args.dataset_dir, args.hidden_size, args.num_layers, args.dropout)
