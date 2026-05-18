@@ -76,7 +76,7 @@ THRESHOLDS = {
     'washing_machine': 10.0,
 }
 
-DEFAULT_DATASET_DIR = 'medium_dataset'
+DEFAULT_DATASET_DIR = 'dataset'
 
 
 # ---------------------------------------------------------------------------
@@ -538,7 +538,7 @@ def _plot_results(history, test_metrics, save_dir):
 def _save_json(test_metrics, hidden_size, dt, save_dir):
     config = {
         'model': 'LNNActorCritic (PPO)',
-        'dataset': 'UKDALE-medium_dataset',
+        'dataset': 'UKDALE-dataset',
         'hyperparams': {
             'WIN': WIN, 'STRIDE': STRIDE, 'BATCH': BATCH,
             'EPOCHS': EPOCHS, 'PATIENCE': PATIENCE, 'LR': LR,
