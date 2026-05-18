@@ -60,14 +60,15 @@ GAMMA        = 0.99    # discount factor
 GAE_LAMBDA   = 0.95    # GAE λ
 PPO_CLIP     = 0.2     # clip ratio ε
 VALUE_COEF   = 0.5     # critic loss weight
-ENTROPY_COEF = 0.01    # entropy bonus weight
+ENTROPY_COEF = 0.05    # entropy bonus weight — higher to prevent std collapse
 PPO_EPOCHS   = 4       # update sweeps per rollout
 ROLLOUT_SIZE = 512     # windows per rollout segment
 
 # Reward shaping
-ALPHA      = 1.0     # disaggregation MAE weight
-BETA_TRANS = 0.05    # state-transition penalty weight
-NORM_POWER = 3000.0  # normalisation constant (W) — typical UK household max
+ALPHA        = 1.0    # disaggregation MAE weight
+BETA_TRANS   = 0.05   # state-transition penalty weight
+GAMMA_SPARSE = 0.5    # sparsity penalty — discourages always-ON collapse
+NORM_POWER   = 3000.0 # normalisation constant (W) — typical UK household max
 
 THRESHOLDS = {
     'dishwasher':      10.0,
@@ -111,7 +112,7 @@ class LNNActorCritic(nn.Module):
         # ── Actor ──────────────────────────────────────────────────────────
         self.actor_mean    = nn.Linear(hidden_size, n_appliances)
         # Per-appliance log-std — learned but shared across the batch
-        self.actor_log_std = nn.Parameter(torch.full((n_appliances,), -1.0))
+        self.actor_log_std = nn.Parameter(torch.full((n_appliances,), 0.0))
 
         # ── Critic ─────────────────────────────────────────────────────────
         self.critic = nn.Linear(hidden_size, 1)
@@ -212,18 +213,19 @@ def create_sequences(df):
 
 def compute_rewards_batch(actions, y_true, prev_actions, y_mins, y_ranges):
     """
-    Vectorised reward: R = -(α·MAE + β·transition) / NORM_POWER
+    Vectorised reward: R = -(α·MAE + β·transition + γ·sparsity) / NORM_POWER
 
     All inputs are (N, n_apps) numpy arrays in scaled [0, 1] space.
     y_mins, y_ranges: (n_apps,) arrays for inverse scaling to Watts.
     """
-    pred_raw = actions    * y_ranges + y_mins
-    true_raw = y_true     * y_ranges + y_mins
+    pred_raw = actions      * y_ranges + y_mins
+    true_raw = y_true       * y_ranges + y_mins
     prev_raw = prev_actions * y_ranges + y_mins
 
-    mae_term   = np.abs(pred_raw - true_raw).mean(axis=1)   # (N,)
-    trans_term = np.abs(pred_raw - prev_raw).mean(axis=1)   # (N,)
-    return -(ALPHA * mae_term + BETA_TRANS * trans_term) / NORM_POWER
+    mae_term     = np.abs(pred_raw - true_raw).mean(axis=1)   # (N,)
+    trans_term   = np.abs(pred_raw - prev_raw).mean(axis=1)   # (N,)
+    sparse_term  = pred_raw.mean(axis=1)                       # (N,) — penalise high predictions
+    return -(ALPHA * mae_term + BETA_TRANS * trans_term + GAMMA_SPARSE * sparse_term) / NORM_POWER
 
 
 # ---------------------------------------------------------------------------
