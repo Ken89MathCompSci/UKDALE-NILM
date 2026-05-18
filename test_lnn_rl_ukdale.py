@@ -60,15 +60,15 @@ GAMMA        = 0.99    # discount factor
 GAE_LAMBDA   = 0.95    # GAE λ
 PPO_CLIP     = 0.2     # clip ratio ε
 VALUE_COEF   = 0.5     # critic loss weight
-ENTROPY_COEF = 0.05    # entropy bonus weight — higher to prevent std collapse
+ENTROPY_COEF = 0.01    # entropy bonus weight
 PPO_EPOCHS   = 4       # update sweeps per rollout
 ROLLOUT_SIZE = 512     # windows per rollout segment
 
 # Reward shaping
 ALPHA        = 1.0    # disaggregation MAE weight
 BETA_TRANS   = 0.05   # state-transition penalty weight
-GAMMA_SPARSE = 0.1    # one-sided over-prediction penalty
-PRETRAIN_EPOCHS = 10  # supervised MSE warm-start before PPO
+GAMMA_SPARSE = 0.0    # disabled: MAE already penalises inaccurate predictions
+PRETRAIN_EPOCHS = 20  # supervised MSE warm-start before PPO
 NORM_POWER   = 3000.0 # normalisation constant (W) — typical UK household max
 
 THRESHOLDS = {
@@ -112,8 +112,8 @@ class LNNActorCritic(nn.Module):
 
         # ── Actor ──────────────────────────────────────────────────────────
         self.actor_mean    = nn.Linear(hidden_size, n_appliances)
-        # Per-appliance log-std — learned but shared across the batch
-        self.actor_log_std = nn.Parameter(torch.full((n_appliances,), 0.0))
+        # Per-appliance log-std — init below clamp ceiling so gradients flow
+        self.actor_log_std = nn.Parameter(torch.full((n_appliances,), -1.0))
 
         # ── Critic ─────────────────────────────────────────────────────────
         self.critic = nn.Linear(hidden_size, 1)
@@ -150,7 +150,7 @@ class LNNActorCritic(nn.Module):
         """
         h    = self._encode(x)
         mean = torch.sigmoid(self.actor_mean(h))          # [0, 1]
-        std  = self.actor_log_std.exp().clamp(0.01, 1.0)
+        std  = self.actor_log_std.exp().clamp(0.01, 2.0)
         dist = Normal(mean, std)
 
         if deterministic:
@@ -168,7 +168,7 @@ class LNNActorCritic(nn.Module):
         """Recompute log_prob / entropy / value for stored (s, a) pairs."""
         h    = self._encode(x)
         mean = torch.sigmoid(self.actor_mean(h))
-        std  = self.actor_log_std.exp().clamp(0.01, 1.0)
+        std  = self.actor_log_std.exp().clamp(0.01, 2.0)
         dist = Normal(mean, std)
         log_prob = dist.log_prob(actions.clamp(1e-6, 1 - 1e-6)).sum(-1)
         entropy  = dist.entropy().sum(-1)
