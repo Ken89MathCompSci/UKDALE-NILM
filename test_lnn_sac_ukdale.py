@@ -59,14 +59,20 @@ LR             = 3e-4
 GAMMA              = 0.99
 TAU                = 0.005   # Polyak averaging coefficient for target networks
 ALPHA_INIT         = 0.2     # initial entropy temperature
-TARGET_ENTROPY     = -float(len(APPLIANCES))   # heuristic: -n_actions
+TARGET_ENTROPY     = -2.0    # less negative = more deterministic target
+                             # NOTE: more negative (e.g. -8) would make the
+                             # policy *more* random, which is the wrong direction
 UPDATES_PER_EPOCH  = 400     # gradient updates per epoch (independent of data)
 REPLAY_CAPACITY    = 50_000
 
-# Reward
-ALPHA_MAE  = 1.0
-BETA_TRANS = 0.05
-NORM_POWER = 3000.0
+# Reward weights
+# Binary accuracy is the primary term — it directly rewards correct ON/OFF
+# threshold crossings, which is what F1 measures.  Continuous MAE and the
+# conservation penalty are secondary regulators.
+ALPHA_MAE       = 1.0     # continuous MAE weight (secondary)
+BETA_TRANS      = 0.05    # transition smoothness weight (secondary)
+BETA_CONSERVE   = 2.0     # aggregate conservation violation weight
+NORM_POWER      = 3000.0  # Watt normaliser for secondary terms
 
 PRETRAIN_EPOCHS = 10
 
@@ -76,8 +82,13 @@ THRESHOLDS = {
     'microwave':       10.0,
     'washing_machine': 10.0,
 }
+# Vectorised version for use in compute_rewards (set after APPLIANCES is known)
+THRESHOLD_ARR = None   # populated at module init below
 
 DEFAULT_DATASET_DIR = 'dataset'
+
+# Initialise threshold array now that APPLIANCES is defined
+THRESHOLD_ARR = np.array([THRESHOLDS[a] for a in APPLIANCES], dtype=np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -267,38 +278,69 @@ def create_sequences(df, stride: int = STRIDE_EVAL):
 
 def create_transitions(df, stride: int = STRIDE_COLLECT):
     """
-    (state, y_target, next_state) triples for the replay buffer.
-    next_state = state window shifted forward by `stride` raw timesteps.
+    (state, y_target, next_state, agg_midpoint) tuples for the replay buffer.
+    next_state   = window shifted forward by `stride` raw timesteps.
+    agg_midpoint = raw aggregate Watts at the window mid-point, used for the
+                   conservation penalty: sum(pred_appliances) ≤ aggregate × 1.1
     """
     mains    = df['aggregate'].values.astype(np.float32)
     app_vals = {a: df[a].values.astype(np.float32) for a in APPLIANCES}
-    X, Y, X_next = [], [], []
+    X, Y, X_next, Agg = [], [], [], []
     for i in range(0, len(mains) - WIN - stride + 1, stride):
         X.append(mains[i: i + WIN])
         mid = i + WIN // 2
         Y.append([app_vals[a][mid] for a in APPLIANCES])
         X_next.append(mains[i + stride: i + stride + WIN])
+        Agg.append(mains[mid])          # raw aggregate Watts — NOT scaled
     X      = np.array(X,      dtype=np.float32).reshape(-1, WIN, 1)
     Y      = np.array(Y,      dtype=np.float32)
     X_next = np.array(X_next, dtype=np.float32).reshape(-1, WIN, 1)
-    return X, Y, X_next
+    Agg    = np.array(Agg,    dtype=np.float32)   # (N,)
+    return X, Y, X_next, Agg
 
 
 # ---------------------------------------------------------------------------
 # Reward
 # ---------------------------------------------------------------------------
 
-def compute_rewards(actions_np, y_true_np, prev_actions_np, y_mins, y_ranges):
+def compute_rewards(actions_np, y_true_np, prev_actions_np,
+                    y_mins, y_ranges, agg_watts):
     """
     Vectorised: (N, n_apps) arrays → (N,) rewards.
-    No sparsity term: MAE already penalises both over- and under-prediction.
+
+    Structure
+    ---------
+    Primary   binary_acc ∈ [0,1] → reward ∈ [-1, +1].  Directly rewards
+              correct ON/OFF threshold crossings — the same signal as F1.
+              This is the key advantage of RL over supervised regression:
+              a non-differentiable threshold can be part of the reward.
+    Secondary continuous MAE + transition smoothness (normalised to Watts)
+    Physics   aggregate conservation: sum(pred) ≤ aggregate × 1.1
     """
     pred  = actions_np      * y_ranges + y_mins   # raw Watts
     true  = y_true_np       * y_ranges + y_mins
     prev  = prev_actions_np * y_ranges + y_mins
+
+    # ── Primary: binary on/off accuracy ───────────────────────────────────
+    pred_on    = pred > THRESHOLD_ARR               # (N, n_apps) bool
+    true_on    = true > THRESHOLD_ARR
+    binary_acc = (pred_on == true_on).mean(axis=1)  # (N,) ∈ [0, 1]
+
+    # ── Secondary: continuous MAE ─────────────────────────────────────────
     mae   = np.abs(pred - true).mean(axis=1)
     trans = np.abs(pred - prev).mean(axis=1)
-    return -(ALPHA_MAE * mae + BETA_TRANS * trans) / NORM_POWER
+
+    # ── Physics: aggregate conservation constraint ────────────────────────
+    # Sum of disaggregated appliances must not exceed the mains aggregate.
+    # A 10% slack accounts for unmetered minor loads.
+    violation = np.maximum(0.0, pred.sum(axis=1) - agg_watts * 1.1)
+
+    # ── Combined ──────────────────────────────────────────────────────────
+    # binary_acc scaled to [-1, +1] is the dominant term;
+    # continuous terms are at most ~0.1 relative to it under normal operation.
+    return (2.0 * binary_acc - 1.0
+            - (ALPHA_MAE * mae + BETA_TRANS * trans
+               + BETA_CONSERVE * violation) / NORM_POWER)
 
 
 # ---------------------------------------------------------------------------
@@ -413,11 +455,10 @@ def evaluate(actor, X, Y_scaled, y_scalers, device):
 # Training
 # ---------------------------------------------------------------------------
 
-def collect_transitions(actor, X_tr, Y_tr, y_mins, y_ranges, buffer, device):
+def collect_transitions(actor, X_tr, Y_tr, Agg_tr, y_mins, y_ranges, device):
     """
     One pass through training data with the stochastic policy.
-    Pushes (state, action, reward, next_state) into the replay buffer.
-    Returns mean reward for logging.
+    Returns (all_acts, rewards) — caller is responsible for buffer pushes.
     """
     actor.eval()
     all_acts = []
@@ -426,11 +467,9 @@ def collect_transitions(actor, X_tr, Y_tr, y_mins, y_ranges, buffer, device):
             xb = torch.FloatTensor(X_tr[i: i + BATCH]).to(device)
             a, _ = actor.get_action(xb, deterministic=False)
             all_acts.append(a.cpu().numpy())
-    all_acts  = np.concatenate(all_acts)                   # (N, n_apps)
-    prev_acts = np.vstack([np.zeros_like(all_acts[:1]),
-                           all_acts[:-1]])                  # shift-by-1 prev
-    rewards   = compute_rewards(all_acts, Y_tr, prev_acts, y_mins, y_ranges)
-    # X_tr pairs with X_tr_next via index (pre-computed in train_model)
+    all_acts  = np.concatenate(all_acts)                  # (N, n_apps)
+    prev_acts = np.vstack([np.zeros_like(all_acts[:1]), all_acts[:-1]])
+    rewards   = compute_rewards(all_acts, Y_tr, prev_acts, y_mins, y_ranges, Agg_tr)
     return all_acts, rewards
 
 
@@ -447,7 +486,7 @@ def train_model(data_splits, save_dir, hidden_size=64, dt=0.1):
     te_df = data_splits['test']
 
     # Replay-buffer transitions (stride=1 for density)
-    X_tr, Y_tr, X_tr_next = create_transitions(tr_df, stride=STRIDE_COLLECT)
+    X_tr, Y_tr, X_tr_next, Agg_tr = create_transitions(tr_df, stride=STRIDE_COLLECT)
     # Eval sequences (stride=5 for speed)
     X_va, Y_va = create_sequences(va_df, stride=STRIDE_EVAL)
     X_te, Y_te = create_sequences(te_df, stride=STRIDE_EVAL)
@@ -500,7 +539,7 @@ def train_model(data_splits, save_dir, hidden_size=64, dt=0.1):
     # ── Initial buffer population with pre-trained actor ─────────────────
     print("Populating replay buffer with pre-trained actor...")
     all_acts, rewards = collect_transitions(
-        actor, X_tr, Y_tr, y_mins, y_ranges, buffer, device)
+        actor, X_tr, Y_tr, Agg_tr, y_mins, y_ranges, device)
     for i in range(len(X_tr)):
         buffer.push(X_tr[i], all_acts[i], rewards[i], X_tr_next[i])
     print(f"  Buffer: {len(buffer):,} transitions  "
@@ -519,7 +558,7 @@ def train_model(data_splits, save_dir, hidden_size=64, dt=0.1):
     for epoch in range(EPOCHS):
         # ── Collect new transitions with the current stochastic policy ────
         all_acts, rewards = collect_transitions(
-            actor, X_tr, Y_tr, y_mins, y_ranges, buffer, device)
+            actor, X_tr, Y_tr, Agg_tr, y_mins, y_ranges, device)
         for i in range(len(X_tr)):
             buffer.push(X_tr[i], all_acts[i], rewards[i], X_tr_next[i])
 
