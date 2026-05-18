@@ -5,19 +5,21 @@ import numpy as np
 
 class LSTMModel(nn.Module):
     """LSTM model for NILM"""
-    def __init__(self, input_size, hidden_size, num_layers, output_size, bidirectional=False):
+    def __init__(self, input_size, hidden_size, num_layers, output_size,
+                 dropout=0.0, bidirectional=False):
         super(LSTMModel, self).__init__()
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.bidirectional = bidirectional
         self.num_directions = 2 if bidirectional else 1
-        
+
         self.lstm = nn.LSTM(
             input_size=input_size,
             hidden_size=hidden_size,
             num_layers=num_layers,
             batch_first=True,
-            bidirectional=bidirectional
+            dropout=dropout if num_layers > 1 else 0.0,
+            bidirectional=bidirectional,
         )
         
         self.fc = nn.Linear(hidden_size * self.num_directions, output_size)
@@ -43,19 +45,21 @@ class LSTMModel(nn.Module):
 
 class GRUModel(nn.Module):
     """GRU model for NILM"""
-    def __init__(self, input_size, hidden_size, num_layers, output_size, bidirectional=False):
+    def __init__(self, input_size, hidden_size, num_layers, output_size,
+                 dropout=0.0, bidirectional=False):
         super(GRUModel, self).__init__()
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.bidirectional = bidirectional
         self.num_directions = 2 if bidirectional else 1
-        
+
         self.gru = nn.GRU(
             input_size=input_size,
             hidden_size=hidden_size,
             num_layers=num_layers,
             batch_first=True,
-            bidirectional=bidirectional
+            dropout=dropout if num_layers > 1 else 0.0,
+            bidirectional=bidirectional,
         )
         
         self.fc = nn.Linear(hidden_size * self.num_directions, output_size)
