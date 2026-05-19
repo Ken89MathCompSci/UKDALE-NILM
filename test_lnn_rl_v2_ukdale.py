@@ -36,6 +36,7 @@ import sys
 import os
 import argparse
 import json
+import time
 import numpy as np
 import pandas as pd
 import torch
@@ -396,6 +397,7 @@ def train_model(data_splits, save_dir, hidden_size=64, dt=0.1):
 
     print("Starting LNN-PPO-v2 training...\n")
 
+    train_start = time.time()
     history = {
         'policy_loss': [], 'value_loss': [], 'entropy': [],
         'mean_reward': [], 'val_metrics': [],
@@ -405,6 +407,7 @@ def train_model(data_splits, save_dir, hidden_size=64, dt=0.1):
     counter    = 0
 
     for epoch in range(EPOCHS):
+        ep_start   = time.time()
         model.train()
         ep_pi_loss = ep_v_loss = ep_ent = ep_reward = 0.0
         n_updates  = 0
@@ -509,11 +512,13 @@ def train_model(data_splits, save_dir, hidden_size=64, dt=0.1):
         avg_f1  = np.mean([val_metrics[a]['f1']  for a in APPLIANCES])
         avg_mae = np.mean([val_metrics[a]['mae'] for a in APPLIANCES])
 
+        ep_time = time.time() - ep_start
         print(
             f"  Epoch {epoch+1:3d}/{EPOCHS}  "
             f"π={ep_pi_loss:.5f}  V={ep_v_loss:.5f}  "
             f"H={ep_ent:.3f}  R={ep_reward:.5f}  "
-            f"avgF1={avg_f1:.4f}  avgMAE={avg_mae:.2f}"
+            f"avgF1={avg_f1:.4f}  avgMAE={avg_mae:.2f}  "
+            f"time={ep_time:.1f}s"
         )
         for app in APPLIANCES:
             m = val_metrics[app]
@@ -532,7 +537,8 @@ def train_model(data_splits, save_dir, hidden_size=64, dt=0.1):
                 print(f"  Early stopping at epoch {epoch+1}")
                 break
 
-    print("Training complete.")
+    total_train_time = time.time() - train_start
+    print(f"Training complete.  Total time: {total_train_time/60:.1f} min ({total_train_time:.0f}s)")
 
     if best_state:
         model.load_state_dict(best_state)
@@ -659,6 +665,7 @@ def parse_args():
 
 
 if __name__ == '__main__':
+    script_start = time.time()
     args = parse_args()
 
     for split in ('train', 'validation', 'test'):
@@ -685,4 +692,6 @@ if __name__ == '__main__':
         hidden_size = args.hidden_size,
         dt          = args.dt,
     )
+    total_time = time.time() - script_start
     print(f"\nAll outputs saved to {save_dir}/")
+    print(f"Total wall-clock time: {total_time/60:.1f} min ({total_time:.0f}s)")
