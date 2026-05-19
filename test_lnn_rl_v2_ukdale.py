@@ -78,10 +78,18 @@ NORM_POWER   = 3000.0 # normalisation constant (W)
 PRETRAIN_EPOCHS = 20  # supervised MSE warm-start
 
 # Reward shaping — v2 additions
-# FP_PENALTY_SCALE: flat cost (in Watts) added per false-positive appliance
-# (= FP_PENALTY_SCALE × threshold; not wattage-proportional to avoid collapse)
-FP_PENALTY_SCALE = 1.0  # multiplier on threshold for flat FP cost (default = 1× threshold = 10W)
-BETA_CONSERVE    = 1.0  # conservation guardrail weight
+# Per-appliance FP penalty scales (multipliers on threshold).
+# Transient/short-burst appliances get a softer penalty so the agent still
+# fires on brief ON events; continuous/long-cycle appliances get harder penalties.
+# A global FP_SCALE_MULT (CLI: --fp-scale) scales the whole array uniformly.
+FP_SCALES = {
+    'dishwasher':      1.5,   # intermittent but long cycle — moderate pressure
+    'fridge':          1.0,   # continuous baseline
+    'microwave':       0.5,   # short transient — soft penalty preserves recall
+    'washing_machine': 0.75,  # multi-stage, intermittent — gentle pressure
+}
+FP_SCALE_MULT = 1.0  # global multiplier on top of per-appliance scales (--fp-scale)
+BETA_CONSERVE = 1.0  # conservation guardrail weight
 
 THRESHOLDS = {
     'dishwasher':      10.0,
@@ -90,6 +98,7 @@ THRESHOLDS = {
     'washing_machine': 10.0,
 }
 THRESHOLD_ARR = np.array([THRESHOLDS[a] for a in APPLIANCES], dtype=np.float32)
+FP_SCALE_ARR  = np.array([FP_SCALES[a]  for a in APPLIANCES], dtype=np.float32)
 
 DEFAULT_DATASET_DIR = 'dataset'
 
@@ -258,13 +267,14 @@ def compute_rewards_batch(actions, y_true, prev_actions, y_mins, y_ranges, agg_w
     f1_per_app = (2.0 * tp) / (2.0 * tp + fp + fn + 1e-8)
     f1_reward  = f1_per_app.mean(axis=1)
 
-    # ── 2. Flat asymmetric FP penalty ────────────────────────────────────
-    # Flat cost per false-positive appliance = FP_PENALTY_SCALE × threshold.
-    # Flat (not wattage-proportional) prevents unbounded penalty that previously
-    # caused the agent to collapse to always-OFF.
+    # ── 2. Per-appliance flat FP penalty ─────────────────────────────────
+    # Cost per FP = FP_SCALE_MULT × FP_SCALE_ARR[i] × threshold[i].
+    # Per-appliance weights let transient appliances (microwave) carry a softer
+    # penalty so recall is preserved, while long-cycle appliances (dishwasher)
+    # receive stronger pressure to suppress phantom loads.
     fp_penalty = np.zeros(N, dtype=np.float32)
     for i in range(len(APPLIANCES)):
-        fp_penalty += fp[:, i] * (FP_PENALTY_SCALE * THRESHOLD_ARR[i])
+        fp_penalty += fp[:, i] * (FP_SCALE_MULT * FP_SCALE_ARR[i] * THRESHOLD_ARR[i])
 
     # ── 3. Conservation guardrail ─────────────────────────────────────────
     conservation = np.maximum(0.0, pred_raw.sum(axis=1) - agg_watts * 1.1)
@@ -365,8 +375,11 @@ def train_model(data_splits, save_dir, hidden_size=64, dt=0.1):
     print(f"\nDevice: {device}  hidden={hidden_size}  dt={dt}")
     print(f"PPO: γ={GAMMA}  λ={GAE_LAMBDA}  ε={PPO_CLIP}  "
           f"α_mae={ALPHA}  β_trans={BETA_TRANS}")
-    print(f"v2 reward: FP_flat={FP_PENALTY_SCALE}×thr  β_conserve={BETA_CONSERVE}  "
-          f"primary=F1")
+    fp_effective = {a: round(FP_SCALE_MULT * FP_SCALES[a] * THRESHOLDS[a], 2)
+                    for a in APPLIANCES}
+    print(f"v2 reward: FP_mult={FP_SCALE_MULT}  β_conserve={BETA_CONSERVE}  primary=F1")
+    print(f"  FP flat cost/appliance (W): " +
+          "  ".join(f"{a}={fp_effective[a]}" for a in APPLIANCES))
 
     tr_df = data_splits['train']
     va_df = data_splits['validation']
@@ -628,7 +641,8 @@ def _save_json(test_metrics, hidden_size, dt, save_dir):
             'VALUE_COEF': VALUE_COEF, 'ENTROPY_COEF': ENTROPY_COEF,
             'PPO_EPOCHS': PPO_EPOCHS, 'ROLLOUT_SIZE': ROLLOUT_SIZE,
             'ALPHA': ALPHA, 'BETA_TRANS': BETA_TRANS, 'NORM_POWER': NORM_POWER,
-            'FP_PENALTY_SCALE': FP_PENALTY_SCALE,
+            'FP_SCALES': FP_SCALES,
+            'FP_SCALE_MULT': FP_SCALE_MULT,
             'BETA_CONSERVE': BETA_CONSERVE,
         },
         'test_metrics': {
@@ -660,8 +674,9 @@ def parse_args():
                    help='MAE reward weight')
     p.add_argument('--beta-trans',     type=float, default=BETA_TRANS,
                    help='Transition penalty weight')
-    p.add_argument('--fp-scale',       type=float, default=FP_PENALTY_SCALE,
-                   help='Flat FP penalty multiplier on threshold (default 1.0 → 10W per FP)')
+    p.add_argument('--fp-scale',       type=float, default=FP_SCALE_MULT,
+                   help='Global FP penalty multiplier applied on top of per-appliance weights '
+                        '(default 1.0). Effective W: dish=15, fridge=10, micro=5, wash=7.5)')
     p.add_argument('--beta-conserve',  type=float, default=BETA_CONSERVE,
                    help='Conservation guardrail weight (default 1.0)')
     p.add_argument('--pretrain',       type=int,   default=PRETRAIN_EPOCHS,
@@ -681,7 +696,7 @@ if __name__ == '__main__':
 
     ALPHA            = args.alpha
     BETA_TRANS       = args.beta_trans
-    FP_PENALTY_SCALE = args.fp_scale
+    FP_SCALE_MULT = args.fp_scale
     BETA_CONSERVE    = args.beta_conserve
     PRETRAIN_EPOCHS  = args.pretrain
 
