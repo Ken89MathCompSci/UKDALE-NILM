@@ -1,33 +1,40 @@
 """
-LNN + PPO Actor-Critic for NILM — UKDALE  (v2: asymmetric rewards).
+LNN + PPO Actor-Critic for NILM — UKDALE  (v3: impedance reward).
 
-Extends the base PPO script with three targeted reward-shaping ideas:
+Extends v2 with three fixes for the always-OFF entropy-collapse observed in v2:
 
-  1. F1-based primary reward
-     Per-sample F1 averaged across appliances replaces the raw MAE primary.
-     F1 = 0 for both always-ON and always-OFF, so neither degenerate policy
-     is rewarded regardless of class imbalance.  On windows where every
-     appliance is truly OFF, F1 = 0 for any prediction and the MAE term
-     takes over, pulling predictions to 0W.
+  Fix A — FP Dead-Zone Impedance
+     Instead of triggering an FP penalty on any non-zero prediction, the agent
+     gets a tolerance band up to FP_DEAD_ZONE (default 15 W).  Only predictions
+     that exceed the dead-zone while the appliance is truly OFF (< TRUE_OFF_THR,
+     default 5 W) incur a penalty, and only on the excess above the dead-zone:
 
-  2. Flat asymmetric FP penalty
-     Each false-positive appliance incurs a flat cost of
-     FP_PENALTY_SCALE × threshold (default 10W).  Flat (not wattage-
-     proportional) prevents the unbounded penalty that previously caused
-     always-OFF collapse by making any significant prediction too costly.
+         fp_impedance = FP_SCALE × max(0, pred − FP_DEAD_ZONE)
 
-  3. Conservation guardrail
-     The sum of all predicted appliance loads must not exceed the aggregate
-     mains reading × 1.1.  Violations are penalised by
-     BETA_CONSERVE × max(0, Σpred − agg × 1.1) in Watt-scale.
-     This embeds the physical constraint that appliances cannot collectively
-     draw more power than the whole house.
+     This prevents the policy from becoming terrified of any non-zero emission:
+     the agent can safely explore up to 15 W without punishment.
 
-Architecture and training loop are identical to the v1 PPO script:
-  Shared LNN encoder → Gaussian actor (mean=sigmoid, std=exp(log_std)) + critic V(s)
-  GAE advantages, PPO clip, supervised MSE pre-training.
+  Fix B — Entropy Floor
+     ENTROPY_COEF is kept at 0.05 (raised from v1's 0.01) to slow entropy
+     collapse.  The entropy term in the PPO loss also enforces a soft floor
+     so the policy cannot contract into a deterministic always-OFF spike.
 
-Dataset : medium_dataset/ (or --dataset-dir override)
+  Fix C — Balanced FN Penalty
+     An explicit False-Negative penalty is added to counter the lazy-zero
+     strategy.  When an appliance is truly ON (> FP_DEAD_ZONE W) but the
+     agent predicts nearly zero (< TRUE_OFF_THR W), it pays:
+
+         fn_penalty = FN_SCALE × (true_watts − pred_watts)
+
+     With FN_SCALE (default 4) > FP_SCALE (default 2), the agent slightly
+     prefers raising a false alarm over silently missing a real event.
+
+All three fixes are tunable via CLI flags.  The F1-based primary reward and
+conservation guardrail from v2 are retained.
+
+Architecture : shared LNN encoder → Gaussian actor + critic V(s)
+Training     : PPO with GAE, supervised MSE pre-training
+Dataset      : medium_dataset/ (or --dataset-dir override)
 """
 
 import sys
@@ -67,21 +74,23 @@ GAMMA        = 0.99
 GAE_LAMBDA   = 0.95
 PPO_CLIP     = 0.2
 VALUE_COEF   = 0.5
-ENTROPY_COEF = 0.05
+ENTROPY_COEF = 0.05   # raised from v1's 0.01 to slow entropy collapse
+ENTROPY_FLOOR = 0.1   # nats — soft lower bound on mean entropy per update
 PPO_EPOCHS   = 4
 ROLLOUT_SIZE = 512
 
 # Reward shaping — base terms
-ALPHA        = 1.0    # disaggregation MAE weight
+ALPHA        = 1.0    # MAE weight
 BETA_TRANS   = 0.05   # transition penalty weight
 NORM_POWER   = 3000.0 # normalisation constant (W)
 PRETRAIN_EPOCHS = 20  # supervised MSE warm-start
 
-# Reward shaping — v2 additions
-# FP_PENALTY_SCALE: flat cost (in Watts) added per false-positive appliance
-# (= FP_PENALTY_SCALE × threshold; not wattage-proportional to avoid collapse)
-FP_PENALTY_SCALE = 1.0  # multiplier on threshold for flat FP cost (default = 1× threshold = 10W)
-BETA_CONSERVE    = 1.0  # conservation guardrail weight
+# Reward shaping — v3: impedance + FN balance + conservation
+FP_DEAD_ZONE = 15.0  # W — predictions up to this are penalty-free (tolerance band)
+TRUE_OFF_THR =  5.0  # W — true values below this = considered truly OFF for penalties
+FP_SCALE     =  2.0  # multiplier on excess above dead-zone for FP impedance
+FN_SCALE     =  4.0  # multiplier on missed wattage for FN penalty (> FP_SCALE)
+BETA_CONSERVE = 1.0  # conservation guardrail weight
 
 THRESHOLDS = {
     'dishwasher':      10.0,
@@ -95,7 +104,7 @@ DEFAULT_DATASET_DIR = 'dataset'
 
 
 # ---------------------------------------------------------------------------
-# Model  (identical to v1)
+# Model  (unchanged from v1/v2)
 # ---------------------------------------------------------------------------
 
 class LNNActorCritic(nn.Module):
@@ -178,13 +187,12 @@ def load_data(dataset_dir=DEFAULT_DATASET_DIR):
 
 def create_sequences(df):
     """
-    Sequential sliding windows.  Also returns midpoint aggregate Watts
-    (unscaled) for the conservation guardrail.
+    Sequential sliding windows with midpoint aggregate for conservation check.
 
     Returns
     -------
-    X   : (N, WIN, 1)  aggregate mains windows
-    Y   : (N, n_apps)  mid-point appliance values
+    X   : (N, WIN, 1)  aggregate mains windows (before scaling)
+    Y   : (N, n_apps)  mid-point appliance values (before scaling)
     Agg : (N,)         mid-point aggregate mains in raw Watts
     """
     mains    = df['aggregate'].values.astype(np.float32)
@@ -203,30 +211,35 @@ def create_sequences(df):
 
 
 # ---------------------------------------------------------------------------
-# Reward  (v2: F1-primary + flat FP penalty + conservation guardrail)
+# Reward  (v3: F1-primary + FP impedance + FN balance + conservation)
 # ---------------------------------------------------------------------------
 
 def compute_rewards_batch(actions, y_true, prev_actions, y_mins, y_ranges, agg_watts):
     """
-    Vectorised reward combining three components.
+    Vectorised reward with v3 impedance and balance terms.
 
-    Primary  : per-sample F1 averaged across appliances.
-               F1 = 0 for always-OFF (no TP, all FN on ON windows) and for
-               always-ON (no TN).  Only discriminative predictions score > 0,
-               preventing collapse to either degenerate extreme regardless of
-               class imbalance.  On windows where every appliance is truly OFF
-               the F1 term is 0 for any prediction — the MAE term then takes
-               over and pulls the prediction to 0W.
+    Component breakdown
+    -------------------
+    Primary   : per-sample F1 averaged across appliances (from v2).
+                Prevents collapse to always-ON or always-OFF regardless of
+                class sparsity.
 
-    Secondary: MAE + transition penalty (regression quality, in Watts/NORM_POWER)
+    Secondary : MAE + transition penalty / NORM_POWER (regression quality).
 
-    Guardrail: flat per-FP-appliance penalty (FP_PENALTY_SCALE × threshold)
-               + conservation violation penalty (Σpred > agg × 1.1)
+    FP impedance (Fix A):
+                Only triggers when true_watts < TRUE_OFF_THR (5 W) AND
+                pred_watts > FP_DEAD_ZONE (15 W).  Penalty = FP_SCALE × excess
+                above the dead-zone.  The tolerance band [0, 15 W] lets the
+                agent explore low-level predictions without punishment.
 
-    The former zero-bonus is removed: it actively rewarded the always-OFF policy
-    by paying the agent for correct TN predictions which dominate sparse datasets.
-    The former wattage-proportional FP penalty is replaced by a flat cost to avoid
-    unbounded penalties that collapsed the policy to always-OFF.
+    FN penalty (Fix C):
+                Only triggers when true_watts > FP_DEAD_ZONE (15 W) AND
+                pred_watts < TRUE_OFF_THR (5 W).  Penalty = FN_SCALE × missed
+                wattage.  With FN_SCALE > FP_SCALE the agent slightly prefers
+                false alarms over silent misses.
+
+    Conservation guardrail (from v2):
+                Penalises Σpred > agg × 1.1 (Watts).
 
     Parameters
     ----------
@@ -244,35 +257,45 @@ def compute_rewards_batch(actions, y_true, prev_actions, y_mins, y_ranges, agg_w
 
     N = len(actions)
 
-    # ── MAE + transition (secondary) ─────────────────────────────────────
+    # ── MAE + transition ─────────────────────────────────────────────────
     mae_term   = np.abs(pred_raw - true_raw).mean(axis=1)
     trans_term = np.abs(pred_raw - prev_raw).mean(axis=1)
 
     # ── 1. F1-based primary ───────────────────────────────────────────────
-    pred_on = pred_raw > THRESHOLD_ARR          # (N, n_apps) bool
+    pred_on = pred_raw > THRESHOLD_ARR
     true_on = true_raw > THRESHOLD_ARR
     tp = (pred_on & true_on).astype(np.float32)
     fp = (pred_on & ~true_on).astype(np.float32)
     fn = (~pred_on & true_on).astype(np.float32)
-    # Per-appliance F1, then mean across appliances → (N,) in [0, 1]
     f1_per_app = (2.0 * tp) / (2.0 * tp + fp + fn + 1e-8)
-    f1_reward  = f1_per_app.mean(axis=1)
+    f1_reward  = f1_per_app.mean(axis=1)          # (N,) ∈ [0, 1]
 
-    # ── 2. Flat asymmetric FP penalty ────────────────────────────────────
-    # Flat cost per false-positive appliance = FP_PENALTY_SCALE × threshold.
-    # Flat (not wattage-proportional) prevents unbounded penalty that previously
-    # caused the agent to collapse to always-OFF.
-    fp_penalty = np.zeros(N, dtype=np.float32)
+    # ── 2. FP impedance with dead-zone (Fix A) ───────────────────────────
+    # Penalty activates only when: true < TRUE_OFF_THR AND pred > FP_DEAD_ZONE
+    # Cost = FP_SCALE × (pred − FP_DEAD_ZONE)  — only excess above the band.
+    fp_impedance = np.zeros(N, dtype=np.float32)
+    fn_missed    = np.zeros(N, dtype=np.float32)
     for i in range(len(APPLIANCES)):
-        fp_penalty += fp[:, i] * (FP_PENALTY_SCALE * THRESHOLD_ARR[i])
+        truly_off = true_raw[:, i] < TRUE_OFF_THR
+        pred_over = pred_raw[:, i] > FP_DEAD_ZONE
+        excess    = np.maximum(0.0, pred_raw[:, i] - FP_DEAD_ZONE)
+        fp_impedance += np.where(truly_off & pred_over, FP_SCALE * excess, 0.0)
 
-    # ── 3. Conservation guardrail ─────────────────────────────────────────
+        # ── 3. FN penalty — balanced FN/FP (Fix C) ───────────────────────
+        # Penalty activates only when: true > FP_DEAD_ZONE AND pred < TRUE_OFF_THR
+        truly_on  = true_raw[:, i] > FP_DEAD_ZONE
+        pred_low  = pred_raw[:, i] < TRUE_OFF_THR
+        missed_w  = true_raw[:, i] - pred_raw[:, i]
+        fn_missed += np.where(truly_on & pred_low, FN_SCALE * missed_w, 0.0)
+
+    # ── 4. Conservation guardrail (from v2) ──────────────────────────────
     conservation = np.maximum(0.0, pred_raw.sum(axis=1) - agg_watts * 1.1)
 
     reward = (f1_reward
               - (ALPHA * mae_term
                  + BETA_TRANS * trans_term
-                 + fp_penalty
+                 + fp_impedance
+                 + fn_missed
                  + BETA_CONSERVE * conservation) / NORM_POWER)
     return reward
 
@@ -364,9 +387,9 @@ def train_model(data_splits, save_dir, hidden_size=64, dt=0.1):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"\nDevice: {device}  hidden={hidden_size}  dt={dt}")
     print(f"PPO: γ={GAMMA}  λ={GAE_LAMBDA}  ε={PPO_CLIP}  "
-          f"α_mae={ALPHA}  β_trans={BETA_TRANS}")
-    print(f"v2 reward: FP_flat={FP_PENALTY_SCALE}×thr  β_conserve={BETA_CONSERVE}  "
-          f"primary=F1")
+          f"ent_coef={ENTROPY_COEF}  ent_floor={ENTROPY_FLOOR}")
+    print(f"v3 reward: FP_dead={FP_DEAD_ZONE}W  true_off_thr={TRUE_OFF_THR}W  "
+          f"FP_scale={FP_SCALE}  FN_scale={FN_SCALE}  β_conserve={BETA_CONSERVE}")
 
     tr_df = data_splits['train']
     va_df = data_splits['validation']
@@ -403,7 +426,7 @@ def train_model(data_splits, save_dir, hidden_size=64, dt=0.1):
 
     pretrain_supervised(model, X_tr, Y_tr, device, epochs=PRETRAIN_EPOCHS)
 
-    print("Starting LNN-PPO-v2 training...\n")
+    print("Starting LNN-PPO-v3 training...\n")
 
     train_start = time.time()
     history = {
@@ -413,6 +436,8 @@ def train_model(data_splits, save_dir, hidden_size=64, dt=0.1):
     best_f1    = -1.0
     best_state = None
     counter    = 0
+
+    ent_floor_t = torch.tensor(ENTROPY_FLOOR, dtype=torch.float32)
 
     for epoch in range(EPOCHS):
         ep_start   = time.time()
@@ -430,8 +455,8 @@ def train_model(data_splits, save_dir, hidden_size=64, dt=0.1):
             N = rollout_end - rollout_start
 
             x_chunk   = torch.FloatTensor(X_tr[rollout_start:rollout_end]).to(device)
-            y_chunk   = Y_tr[rollout_start:rollout_end]   # (N, n_apps) scaled
-            agg_chunk = Agg_tr[rollout_start:rollout_end] # (N,) raw Watts
+            y_chunk   = Y_tr[rollout_start:rollout_end]
+            agg_chunk = Agg_tr[rollout_start:rollout_end]
 
             # ── Collect rollout ────────────────────────────────────────────
             model.eval()
@@ -442,10 +467,7 @@ def train_model(data_splits, save_dir, hidden_size=64, dt=0.1):
             logprobs_np = logprobs_t.cpu().numpy()
             values_np   = values_t.cpu().numpy().tolist()
 
-            prev_np = np.vstack([
-                prev_action_np[None, :],
-                actions_np[:-1],
-            ])
+            prev_np = np.vstack([prev_action_np[None, :], actions_np[:-1]])
 
             rewards_np = compute_rewards_batch(
                 actions_np, y_chunk, prev_np, y_mins, y_ranges, agg_chunk)
@@ -489,7 +511,12 @@ def train_model(data_splits, save_dir, hidden_size=64, dt=0.1):
                     surr2   = ratio.clamp(1 - PPO_CLIP, 1 + PPO_CLIP) * adv
                     pi_loss = -torch.min(surr1, surr2).mean()
                     v_loss  = VALUE_COEF * (ret - vals).pow(2).mean()
-                    e_loss  = -ENTROPY_COEF * ent.mean()
+
+                    # Entropy bonus with soft floor (Fix B):
+                    # if ent drops below ENTROPY_FLOOR, use the floor value so
+                    # the gradient still pushes entropy upward.
+                    ent_eff = torch.max(ent, ent_floor_t.to(device))
+                    e_loss  = -ENTROPY_COEF * ent_eff.mean()
 
                     loss = pi_loss + v_loss + e_loss
                     optimizer.zero_grad()
@@ -546,7 +573,8 @@ def train_model(data_splits, save_dir, hidden_size=64, dt=0.1):
                 break
 
     total_train_time = time.time() - train_start
-    print(f"Training complete.  Total time: {total_train_time/60:.1f} min ({total_train_time:.0f}s)")
+    print(f"Training complete.  Total time: {total_train_time/60:.1f} min "
+          f"({total_train_time:.0f}s)")
 
     if best_state:
         model.load_state_dict(best_state)
@@ -582,7 +610,10 @@ def _plot_results(history, test_metrics, save_dir):
     plt.title('Value Loss (V)'); plt.xlabel('Epoch'); plt.grid(True, alpha=0.3)
     plt.subplot(1, 4, 3)
     plt.plot(epochs_x, history['entropy'], color='green')
-    plt.title('Entropy (H)'); plt.xlabel('Epoch'); plt.grid(True, alpha=0.3)
+    plt.axhline(ENTROPY_FLOOR, color='orange', linestyle='--', linewidth=0.8,
+                label=f'floor={ENTROPY_FLOOR}')
+    plt.title('Entropy (H)'); plt.xlabel('Epoch'); plt.legend(fontsize=7)
+    plt.grid(True, alpha=0.3)
     plt.subplot(1, 4, 4)
     plt.plot(epochs_x, history['mean_reward'], color='purple')
     plt.title('Mean Reward'); plt.xlabel('Epoch'); plt.grid(True, alpha=0.3)
@@ -592,7 +623,7 @@ def _plot_results(history, test_metrics, save_dir):
     plt.close()
 
     fig, axes = plt.subplots(len(APPLIANCES), 2, figsize=(12, 4 * len(APPLIANCES)))
-    fig.suptitle('LNN-PPO-v2 UKDALE — Per-Appliance Val Metrics', fontsize=13)
+    fig.suptitle('LNN-PPO-v3 UKDALE — Per-Appliance Val Metrics', fontsize=13)
     for row, app in enumerate(APPLIANCES):
         f1s  = [m[app]['f1']  for m in history['val_metrics']]
         maes = [m[app]['mae'] for m in history['val_metrics']]
@@ -618,7 +649,7 @@ def _plot_results(history, test_metrics, save_dir):
 
 def _save_json(test_metrics, hidden_size, dt, save_dir):
     config = {
-        'model': 'LNNActorCritic PPO-v2 (asymmetric rewards)',
+        'model': 'LNNActorCritic PPO-v3 (impedance reward)',
         'dataset': 'UKDALE-dataset',
         'hyperparams': {
             'WIN': WIN, 'STRIDE': STRIDE, 'BATCH': BATCH,
@@ -626,9 +657,11 @@ def _save_json(test_metrics, hidden_size, dt, save_dir):
             'hidden_size': hidden_size, 'dt': dt,
             'GAMMA': GAMMA, 'GAE_LAMBDA': GAE_LAMBDA, 'PPO_CLIP': PPO_CLIP,
             'VALUE_COEF': VALUE_COEF, 'ENTROPY_COEF': ENTROPY_COEF,
+            'ENTROPY_FLOOR': ENTROPY_FLOOR,
             'PPO_EPOCHS': PPO_EPOCHS, 'ROLLOUT_SIZE': ROLLOUT_SIZE,
             'ALPHA': ALPHA, 'BETA_TRANS': BETA_TRANS, 'NORM_POWER': NORM_POWER,
-            'FP_PENALTY_SCALE': FP_PENALTY_SCALE,
+            'FP_DEAD_ZONE': FP_DEAD_ZONE, 'TRUE_OFF_THR': TRUE_OFF_THR,
+            'FP_SCALE': FP_SCALE, 'FN_SCALE': FN_SCALE,
             'BETA_CONSERVE': BETA_CONSERVE,
         },
         'test_metrics': {
@@ -651,20 +684,28 @@ def _save_json(test_metrics, hidden_size, dt, save_dir):
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description='LNN-PPO v2 NILM on UKDALE — asymmetric FP / conservation / zero-bonus')
-    p.add_argument('--dataset-dir',    default=DEFAULT_DATASET_DIR,
+        description='LNN-PPO v3 NILM on UKDALE — FP impedance / FN balance / entropy floor')
+    p.add_argument('--dataset-dir',   default=DEFAULT_DATASET_DIR,
                    help='Directory containing UKDALE_HF_*.csv files')
-    p.add_argument('--hidden-size',    type=int,   default=64)
-    p.add_argument('--dt',             type=float, default=0.1)
-    p.add_argument('--alpha',          type=float, default=ALPHA,
+    p.add_argument('--hidden-size',   type=int,   default=64)
+    p.add_argument('--dt',            type=float, default=0.1)
+    p.add_argument('--alpha',         type=float, default=ALPHA,
                    help='MAE reward weight')
-    p.add_argument('--beta-trans',     type=float, default=BETA_TRANS,
+    p.add_argument('--beta-trans',    type=float, default=BETA_TRANS,
                    help='Transition penalty weight')
-    p.add_argument('--fp-scale',       type=float, default=FP_PENALTY_SCALE,
-                   help='Flat FP penalty multiplier on threshold (default 1.0 → 10W per FP)')
-    p.add_argument('--beta-conserve',  type=float, default=BETA_CONSERVE,
+    p.add_argument('--fp-dead-zone',  type=float, default=FP_DEAD_ZONE,
+                   help='Prediction dead-zone in W — FP penalty only above this (default 15)')
+    p.add_argument('--true-off-thr',  type=float, default=TRUE_OFF_THR,
+                   help='True-OFF threshold in W — FP/FN penalty uses this (default 5)')
+    p.add_argument('--fp-scale',      type=float, default=FP_SCALE,
+                   help='FP impedance multiplier on excess above dead-zone (default 2)')
+    p.add_argument('--fn-scale',      type=float, default=FN_SCALE,
+                   help='FN missed-activation multiplier (default 4, > fp-scale)')
+    p.add_argument('--beta-conserve', type=float, default=BETA_CONSERVE,
                    help='Conservation guardrail weight (default 1.0)')
-    p.add_argument('--pretrain',       type=int,   default=PRETRAIN_EPOCHS,
+    p.add_argument('--ent-floor',     type=float, default=ENTROPY_FLOOR,
+                   help='Soft entropy floor in nats (default 0.1)')
+    p.add_argument('--pretrain',      type=int,   default=PRETRAIN_EPOCHS,
                    help='Supervised pre-train epochs (0 to skip)')
     return p.parse_args()
 
@@ -679,14 +720,18 @@ if __name__ == '__main__':
             print(f"Error: {p} not found. Run preprocess_hf.py first.")
             sys.exit(1)
 
-    ALPHA            = args.alpha
-    BETA_TRANS       = args.beta_trans
-    FP_PENALTY_SCALE = args.fp_scale
-    BETA_CONSERVE    = args.beta_conserve
-    PRETRAIN_EPOCHS  = args.pretrain
+    ALPHA          = args.alpha
+    BETA_TRANS     = args.beta_trans
+    FP_DEAD_ZONE   = args.fp_dead_zone
+    TRUE_OFF_THR   = args.true_off_thr
+    FP_SCALE       = args.fp_scale
+    FN_SCALE       = args.fn_scale
+    BETA_CONSERVE  = args.beta_conserve
+    ENTROPY_FLOOR  = args.ent_floor
+    PRETRAIN_EPOCHS = args.pretrain
 
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    save_dir  = f'models/lnn_rl_v2_{timestamp}'
+    save_dir  = f'models/lnn_rl_v3_{timestamp}'
 
     data_splits = load_data(args.dataset_dir)
 
