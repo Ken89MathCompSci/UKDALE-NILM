@@ -178,7 +178,9 @@ def train_on_appliance(splits, appliance, dataset_dir=DEFAULT_DATASET_DIR,
         history['val_loss'].append(va_loss)
         history['val_metrics'].append(m)
         print(f"    Ep {epoch+1:3d}  train={tr_loss:.5f}  val={va_loss:.5f}  "
-              f"F1={m['f1']:.4f}  MAE={m['mae']:.2f}  SAE={m['sae']:.4f}")
+              f"F1={m['f1']:.4f}  P={m['precision']:.4f}  R={m['recall']:.4f}  "
+              f"MAE={m['mae']:.2f}  SAE={m['sae']:.4f}  "
+              f"TP={m['TP']}  FP={m['FP']}  TN={m['TN']}  FN={m['FN']}")
         if va_loss < best_val:
             best_val = va_loss; counter = 0
             best_state = {k: v.clone() for k, v in model.state_dict().items()}
@@ -199,7 +201,9 @@ def train_on_appliance(splits, appliance, dataset_dir=DEFAULT_DATASET_DIR,
     _, to, tt = _run_epoch(model, te_loader, criterion, optimizer, device, False)
     pre_ft_metrics = _metrics(ys.inverse_transform(tt).flatten(),
                                ys.inverse_transform(to).flatten())
-    print(f"  Test BEFORE fine-tune: F1={pre_ft_metrics['f1']:.4f}  MAE={pre_ft_metrics['mae']:.2f}  SAE={pre_ft_metrics['sae']:.4f}")
+    print(f"  Test BEFORE fine-tune: F1={pre_ft_metrics['f1']:.4f}  P={pre_ft_metrics['precision']:.4f}  R={pre_ft_metrics['recall']:.4f}  "
+          f"MAE={pre_ft_metrics['mae']:.2f}  SAE={pre_ft_metrics['sae']:.4f}  "
+          f"TP={pre_ft_metrics['TP']}  FP={pre_ft_metrics['FP']}  TN={pre_ft_metrics['TN']}  FN={pre_ft_metrics['FN']}")
 
     # ── Phase 2: Fine-tune ─────────────────────────────────────────────────
     print("  Phase 2: Fine-tune")
@@ -225,7 +229,9 @@ def train_on_appliance(splits, appliance, dataset_dir=DEFAULT_DATASET_DIR,
     _, to, tt = _run_epoch(model, te_loader, criterion, ft_optimizer, device, False)
     test_metrics = _metrics(ys.inverse_transform(tt).flatten(),
                              ys.inverse_transform(to).flatten())
-    print(f"  Test AFTER  fine-tune: F1={test_metrics['f1']:.4f}  MAE={test_metrics['mae']:.2f}  SAE={test_metrics['sae']:.4f}")
+    print(f"  Test AFTER  fine-tune: F1={test_metrics['f1']:.4f}  P={test_metrics['precision']:.4f}  R={test_metrics['recall']:.4f}  "
+          f"MAE={test_metrics['mae']:.2f}  SAE={test_metrics['sae']:.4f}  "
+          f"TP={test_metrics['TP']}  FP={test_metrics['FP']}  TN={test_metrics['TN']}  FN={test_metrics['FN']}")
 
     # ── Plot ───────────────────────────────────────────────────────────────
     ep = range(1, len(history['train_loss']) + 1)

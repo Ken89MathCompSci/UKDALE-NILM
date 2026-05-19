@@ -82,11 +82,15 @@ def calculate_nilm_metrics(y_true, y_pred, threshold=10, scaler=None):
         'mae': mae,
         'rmse': rmse,
         'nete': nete,
-        'sae': sae,  # Custom SAE calculation
-        'traditional_sae': traditional_sae,  # Traditional SAE for comparison
+        'sae': sae,
+        'traditional_sae': traditional_sae,
         'precision': precision,
         'recall': recall,
-        'f1': f1
+        'f1': f1,
+        'TP': int(tp),
+        'TN': int(tn),
+        'FP': int(fp),
+        'FN': int(fn),
     }
 
 def save_model(model, model_params, train_params, metrics, model_path):
