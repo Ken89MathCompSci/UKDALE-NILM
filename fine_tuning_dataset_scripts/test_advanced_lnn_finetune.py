@@ -16,6 +16,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import json
 from datetime import datetime
+import time
 import pandas as pd
 from sklearn.preprocessing import MinMaxScaler
 
@@ -157,6 +158,8 @@ def train_on_appliance(splits, appliance, dataset_dir=DEFAULT_DATASET_DIR,
     model = AdvancedLiquidNetworkModel(input_size=1, hidden_size=hidden_size,
                                        output_size=1, num_layers=num_layers,
                                        dt=dt).to(device)
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"  Parameters: {n_params:,}")
     criterion = torch.nn.MSELoss()
 
     # -- Phase 1: Pretrain ----------------------------------------------------
@@ -167,7 +170,9 @@ def train_on_appliance(splits, appliance, dataset_dir=DEFAULT_DATASET_DIR,
     history = {'train_loss': [], 'val_loss': [], 'val_metrics': []}
     best_val  = float('inf'); best_state = None; counter = 0
 
+    pretrain_start = time.time()
     for epoch in range(EPOCHS):
+        ep_start = time.time()
         tr_loss, _, _   = _run_epoch(model, pre_loader, criterion, optimizer, device, True)
         va_loss, vo, vt = _run_epoch(model, val_loader, criterion, optimizer, device, False)
         scheduler.step(va_loss)
@@ -177,10 +182,11 @@ def train_on_appliance(splits, appliance, dataset_dir=DEFAULT_DATASET_DIR,
         history['train_loss'].append(tr_loss)
         history['val_loss'].append(va_loss)
         history['val_metrics'].append(m)
+        ep_time = time.time() - ep_start
         print(f"    Ep {epoch+1:3d}  train={tr_loss:.5f}  val={va_loss:.5f}  "
               f"F1={m['f1']:.4f}  P={m['precision']:.4f}  R={m['recall']:.4f}  "
               f"MAE={m['mae']:.2f}  SAE={m['sae']:.4f}  "
-              f"TP={m['TP']}  FP={m['FP']}  TN={m['TN']}  FN={m['FN']}")
+              f"TP={m['TP']}  FP={m['FP']}  TN={m['TN']}  FN={m['FN']}  time={ep_time:.1f}s")
         if va_loss < best_val:
             best_val = va_loss; counter = 0
             best_state = {k: v.clone() for k, v in model.state_dict().items()}
@@ -196,6 +202,7 @@ def train_on_appliance(splits, appliance, dataset_dir=DEFAULT_DATASET_DIR,
                 break
 
     model.load_state_dict(best_state)
+    print(f"  Phase 1 total: {(time.time()-pretrain_start)/60:.1f} min")
 
     # Before fine-tune test
     _, to, tt = _run_epoch(model, te_loader, criterion, optimizer, device, False)
@@ -211,10 +218,13 @@ def train_on_appliance(splits, appliance, dataset_dir=DEFAULT_DATASET_DIR,
     best_ft = float('inf'); best_ft_state = None; ft_counter = 0
     ft_history = {'train_loss': []}
 
+    ft_start = time.time()
     for epoch in range(EPOCHS_FT):
+        ep_start = time.time()
         tr_loss, _, _ = _run_epoch(model, ft_loader, criterion, ft_optimizer, device, True)
         ft_history['train_loss'].append(tr_loss)
-        print(f"    FT Ep {epoch+1:2d}  loss={tr_loss:.5f}")
+        ep_time = time.time() - ep_start
+        print(f"    FT Ep {epoch+1:2d}  loss={tr_loss:.5f}  time={ep_time:.1f}s")
         if tr_loss < best_ft:
             best_ft = tr_loss; ft_counter = 0
             best_ft_state = {k: v.clone() for k, v in model.state_dict().items()}
@@ -224,6 +234,7 @@ def train_on_appliance(splits, appliance, dataset_dir=DEFAULT_DATASET_DIR,
                 print(f"    FT early stopping at epoch {epoch+1}"); break
 
     model.load_state_dict(best_ft_state)
+    print(f"  Phase 2 total: {(time.time()-ft_start)/60:.1f} min")
 
     # -- Phase 3: Test --------------------------------------------------------
     _, to, tt = _run_epoch(model, te_loader, criterion, ft_optimizer, device, False)
@@ -294,6 +305,7 @@ def run_all(dataset_dir=DEFAULT_DATASET_DIR, hidden_size=64, num_layers=2, dt=0.
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     base_dir  = f"models/advanced_lnn_finetune_{timestamp}"
     all_results = {}
+    wall_start = time.time()
 
     for app in APPLIANCES:
         print(f"\n{'='*60}\nAdvanced LNN -- {app}\n{'='*60}")
@@ -330,6 +342,7 @@ def run_all(dataset_dir=DEFAULT_DATASET_DIR, hidden_size=64, num_layers=2, dt=0.
     for app, r in all_results.items():
         print(f"  {app:<20} F1 {r['before_finetune']['f1']:.4f} -> {r['after_finetune']['f1']:.4f}  "
               f"MAE {r['before_finetune']['mae']:.1f} -> {r['after_finetune']['mae']:.1f}")
+    print(f"Total wall-clock time: {(time.time()-wall_start)/60:.1f} min")
     return all_results
 
 
