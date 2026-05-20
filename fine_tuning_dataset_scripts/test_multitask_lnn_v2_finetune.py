@@ -75,7 +75,15 @@ EPOCHS_FT = 30;  PATIENCE_FT = 10;  LR_FT = 1e-4
 W_REG = 1.0;  W_CLS = 0.5;  W_SMOOTH = 0.1;  W_CONS = 0.05
 
 # Improvement 1: focal loss
-FOCAL_GAMMA = 2.0;  FOCAL_ALPHA = 0.25
+FOCAL_GAMMA = 2.0;  FOCAL_ALPHA = 0.75   # high alpha → up-weights rare ON samples
+
+# Per-appliance classification thresholds (tuned for typical ON-rate differences)
+CLASS_THRESHOLDS = {
+    'dishwasher':      0.35,
+    'fridge':          0.65,
+    'microwave':       0.25,
+    'washing_machine': 0.40,
+}
 
 # Improvement 3: TCN
 TCN_HIDDEN = 32;  TCN_LAYERS = 3   # dilations: 1, 2, 4
@@ -86,10 +94,17 @@ TCN_HIDDEN = 32;  TCN_LAYERS = 3   # dilations: 1, 2, 4
 # ---------------------------------------------------------------------------
 
 def focal_bce(pred, target):
-    """Focal loss for binary targets. References globals FOCAL_GAMMA / FOCAL_ALPHA."""
-    bce = F.binary_cross_entropy(pred, target, reduction='none')
-    p_t = torch.where(target == 1.0, pred, 1.0 - pred)
-    return (FOCAL_ALPHA * (1.0 - p_t).pow(FOCAL_GAMMA) * bce).mean()
+    """Focal loss with per-sample alpha: FOCAL_ALPHA for ON, 1-FOCAL_ALPHA for OFF."""
+    eps     = 1e-6
+    pred    = pred.clamp(eps, 1.0 - eps)
+    bce     = F.binary_cross_entropy(pred, target, reduction='none')
+    p_t     = torch.where(target == 1.0, pred, 1.0 - pred)
+    alpha_t = torch.where(
+        target == 1.0,
+        torch.full_like(target, FOCAL_ALPHA),
+        torch.full_like(target, 1.0 - FOCAL_ALPHA),
+    )
+    return (alpha_t * (1.0 - p_t).pow(FOCAL_GAMMA) * bce).mean()
 
 
 # ---------------------------------------------------------------------------
@@ -376,7 +391,7 @@ def _metrics_per_appliance(pred_power_sc, pred_class_arr,
         sae = float(abs(raw_pred.sum() - raw_true.sum()) / (raw_true.sum() + 1e-8))
 
         # Classification metrics from the dedicated class head
-        pred_on = pred_class_arr[:, i] > 0.5
+        pred_on = pred_class_arr[:, i] > CLASS_THRESHOLDS[app]
         true_on = true_class_arr[:, i] > 0.5
         tp = int(( pred_on &  true_on).sum())
         fp = int(( pred_on & ~true_on).sum())
@@ -432,6 +447,12 @@ def run_all(dataset_dir=DEFAULT_DATASET_DIR, hidden_size=64, n_heads=2,
     X_val, Yp_val, Yc_val, Yt_val, Ag_val = create_sequences(splits['validation'])
     X_ft,  Yp_ft,  Yc_ft,  Yt_ft,  Ag_ft  = create_sequences(splits['finetune'])
     X_te,  Yp_te,  Yc_te,  Yt_te,  Ag_te  = create_sequences(splits['test'])
+
+    print("\nClass balance (fraction ON per appliance):")
+    print(f"  {'App':<22} {'pretrain':>10} {'val':>10} {'finetune':>10} {'test':>10}")
+    for i, app in enumerate(APPLIANCES):
+        print(f"  {app:<22} {Yc_pre[:, i].mean():>10.4f} {Yc_val[:, i].mean():>10.4f} "
+              f"{Yc_ft[:, i].mean():>10.4f} {Yc_te[:, i].mean():>10.4f}")
 
     # ── Scale ─────────────────────────────────────────────────────────────
     xs = MinMaxScaler()
@@ -499,7 +520,7 @@ def run_all(dataset_dir=DEFAULT_DATASET_DIR, hidden_size=64, n_heads=2,
                ('train_loss', 'val_loss', 'train_reg', 'train_cls',
                 'train_smooth', 'train_cons',
                 'val_reg', 'val_cls', 'val_smooth', 'val_cons', 'val_metrics')}
-    best_val   = float('inf');  best_state = None;  counter = 0
+    best_score = -float('inf');  best_state = None;  counter = 0
     pretrain_start = time.time()
 
     for epoch in range(EPOCHS):
@@ -531,8 +552,9 @@ def run_all(dataset_dir=DEFAULT_DATASET_DIR, hidden_size=64, n_heads=2,
                   f"R={m['recall']:.4f}  MAE={m['mae']:.2f}  SAE={m['sae']:.4f}  "
                   f"TP={m['TP']}  FP={m['FP']}  TN={m['TN']}  FN={m['FN']}")
 
-        if va[0] < best_val:
-            best_val = va[0];  counter = 0
+        score = avg_f1 - 0.001 * avg_mae
+        if score > best_score:
+            best_score = score;  counter = 0
             best_state = {k: v.clone() for k, v in model.state_dict().items()}
             save_model(model,
                        {'input_size': 1, 'hidden_size': hidden_size,
@@ -554,7 +576,16 @@ def run_all(dataset_dir=DEFAULT_DATASET_DIR, hidden_size=64, n_heads=2,
 
     # ── Phase 2: Fine-tune ────────────────────────────────────────────────
     print(f"\n{'='*60}\nPhase 2: Fine-tune  ({EPOCHS_FT} epochs max)\n{'='*60}")
-    ft_opt     = torch.optim.Adam(model.parameters(), lr=LR_FT)
+    # Freeze shared encoder; adapt only output heads to the small fine-tune set
+    for p in model.parameters():
+        p.requires_grad = False
+    for module in [model.appliance_emb, model.power_head,
+                   model.class_head, model.trans_head]:
+        for p in module.parameters():
+            p.requires_grad = True
+
+    ft_opt     = torch.optim.Adam(
+        filter(lambda p: p.requires_grad, model.parameters()), lr=LR_FT)
     best_ft    = float('inf');  best_ft_state = None;  ft_counter = 0
     ft_history = {'train_loss': []}
     ft_start   = time.time()
