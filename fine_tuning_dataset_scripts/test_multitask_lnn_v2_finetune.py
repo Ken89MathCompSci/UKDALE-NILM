@@ -71,22 +71,23 @@ EPOCHS = 80;  PATIENCE = 20;  LR = 1e-3
 # Phase 2: fine-tuning
 EPOCHS_FT = 30;  PATIENCE_FT = 10;  LR_FT = 1e-4
 
-# House 5 interleaved re-split (prevents all-ON/OFF pathological splits)
-FT_CHUNK_MINUTES = 5    # per cycle: assigned to fine-tuning
-TE_CHUNK_MINUTES = 30   # per cycle: assigned to test
+# House 5 random-chunk re-split (prevents temporally-clustered class imbalance)
+RESPLIT_CHUNK_MINUTES = 35    # granularity of each shuffled chunk
+RESPLIT_FT_RATIO      = 0.10  # fraction of chunks → fine-tuning
+RESPLIT_SEED          = 42
 
 # Loss weights
-W_REG = 1.0;  W_CLS = 0.5;  W_SMOOTH = 0.1;  W_CONS = 0.05
+W_REG = 1.0;  W_CLS = 0.5;  W_SMOOTH = 0.1;  W_CONS = 0.01
 
 # Improvement 1: focal loss
-FOCAL_GAMMA = 2.0;  FOCAL_ALPHA = 0.75   # high alpha → up-weights rare ON samples
+FOCAL_GAMMA = 2.0;  FOCAL_ALPHA = 0.35   # moderate; 0.75 caused FP explosion on rare appliances
 
 # Per-appliance classification thresholds (tuned for typical ON-rate differences)
 CLASS_THRESHOLDS = {
     'dishwasher':      0.35,
     'fridge':          0.65,
-    'microwave':       0.25,
-    'washing_machine': 0.40,
+    'microwave':       0.85,   # rare event → requires high-confidence prediction
+    'washing_machine': 0.75,   # rare → requires high-confidence prediction
 }
 
 # Improvement 3: TCN
@@ -282,26 +283,24 @@ def create_sequences(df):
 
 def _resplit_house5(ft_df, te_df):
     """
-    Concatenate House 5 finetune+test splits then re-split with interleaved chunks.
-
-    Each cycle: FT_CHUNK_MINUTES → fine-tuning, TE_CHUNK_MINUTES → test.
-    Ensures every appliance's ON/OFF events appear in both splits, preventing
-    the degenerate case where one appliance is always ON (or always OFF) in a split.
+    Concatenate House 5 splits, shuffle RESPLIT_CHUNK_MINUTES-sized chunks randomly,
+    assign RESPLIT_FT_RATIO of them to fine-tuning and the rest to test.
+    Random assignment prevents temporally-clustered appliance activity from landing
+    entirely in one split (the periodic-slice failure mode that causes all-ON splits).
     """
-    house5    = pd.concat([ft_df, te_df], ignore_index=True)
+    house5     = pd.concat([ft_df, te_df], ignore_index=True)
     X, Yp, Yc, Yt, Ag = create_sequences(house5)
-    N         = len(X)
-    cycle_seq = max(1, int((FT_CHUNK_MINUTES + TE_CHUNK_MINUTES) * 60 / STRIDE))
-    ft_seq    = max(1, int(FT_CHUNK_MINUTES * 60 / STRIDE))
-    ft_idx, te_idx = [], []
-    for start in range(0, N, cycle_seq):
-        for j in range(start, min(start + cycle_seq, N)):
-            if j - start < ft_seq:
-                ft_idx.append(j)
-            else:
-                te_idx.append(j)
-    print(f"  House 5 re-split: {len(ft_idx)} FT windows, {len(te_idx)} test windows "
-          f"({FT_CHUNK_MINUTES}min FT / {TE_CHUNK_MINUTES}min test per cycle)")
+    N          = len(X)
+    chunk_size = max(1, int(RESPLIT_CHUNK_MINUTES * 60 / STRIDE))
+    chunks     = [np.arange(start, min(start + chunk_size, N))
+                  for start in range(0, N, chunk_size)]
+    rng = np.random.default_rng(RESPLIT_SEED)
+    rng.shuffle(chunks)
+    n_ft   = max(1, int(RESPLIT_FT_RATIO * len(chunks)))
+    ft_idx = np.concatenate(chunks[:n_ft])
+    te_idx = np.concatenate(chunks[n_ft:])
+    print(f"  House 5 re-split (random {RESPLIT_CHUNK_MINUTES}min chunks, "
+          f"seed={RESPLIT_SEED}): {len(ft_idx)} FT, {len(te_idx)} test windows")
     return (X[ft_idx], Yp[ft_idx], Yc[ft_idx], Yt[ft_idx], Ag[ft_idx],
             X[te_idx], Yp[te_idx], Yc[te_idx], Yt[te_idx], Ag[te_idx])
 
@@ -368,12 +367,8 @@ def _run_epoch(model, loader, optimizer, y_mins_t, y_ranges_t, device, train=Tru
             L_reg = F.smooth_l1_loss(pred_power, yb_pw)
             L_cls = focal_bce(pred_class, yb_cl)         # Improvement 1
 
-            if pred_power.shape[0] > 1:
-                L_tv = F.l1_loss(pred_power[1:], pred_power[:-1].detach())
-            else:
-                L_tv = pred_power.new_tensor(0.0)
-            L_trans  = focal_bce(pred_trans, yb_tr)      # focal for transitions too
-            L_smooth = 0.5 * L_tv + 0.5 * L_trans
+            L_trans  = focal_bce(pred_trans, yb_tr)
+            L_smooth = L_trans   # TV removed: batch dim ≠ time, so L_tv was invalid
 
             pred_raw = pred_power * y_ranges_t + y_mins_t
             excess   = F.relu(pred_raw.sum(dim=1) - agg * 1.1)
@@ -417,9 +412,20 @@ def _metrics_per_appliance(pred_power_sc, pred_class_arr,
             pred_power_sc[:, i:i+1]).flatten()
         raw_true = y_scalers[i].inverse_transform(
             true_power_sc[:, i:i+1]).flatten()
-        mae       = float(np.abs(raw_pred - raw_true).mean())
-        sae_abs   = float(abs(raw_pred.sum() - raw_true.sum()))
-        sae_ratio = float(abs(raw_pred.sum() - raw_true.sum()) / (raw_true.sum() + 1e-8))
+        mae          = float(np.abs(raw_pred - raw_true).mean())
+        energy_error = abs(raw_pred.sum() - raw_true.sum())
+        sae_abs      = float(energy_error)
+        sae_ratio    = float(energy_error / (raw_true.sum() + 1e-8))
+        # Chunked SAE matching utils.calculate_nilm_metrics: group into WIN-sample
+        # blocks, sum absolute energy diff per block, divide by total samples.
+        n_chunks = len(raw_pred) // WIN
+        if n_chunks > 0:
+            pc = raw_pred[:n_chunks * WIN].reshape(n_chunks, WIN)
+            tc = raw_true[:n_chunks * WIN].reshape(n_chunks, WIN)
+            sae_avg = float(np.abs(pc.sum(axis=1) - tc.sum(axis=1)).sum()
+                            / (n_chunks * WIN))
+        else:
+            sae_avg = sae_abs / max(len(raw_pred), 1)
 
         # Classification metrics from the dedicated class head
         pred_on = pred_class_arr[:, i] > CLASS_THRESHOLDS[app]
@@ -434,7 +440,8 @@ def _metrics_per_appliance(pred_power_sc, pred_class_arr,
 
         results[app] = {
             'f1': float(f1), 'precision': float(precision), 'recall': float(recall),
-            'mae': mae, 'sae_abs': sae_abs, 'sae_ratio': sae_ratio,
+            'mae': mae,
+            'sae_abs': sae_abs, 'sae_avg': sae_avg, 'sae_ratio': sae_ratio,
             'TP': tp, 'FP': fp, 'TN': tn, 'FN': fn,
         }
     return results
@@ -443,10 +450,10 @@ def _metrics_per_appliance(pred_power_sc, pred_class_arr,
 def _print_metrics(label, metrics):
     print(f"  {label}")
     print(f"    {'App':<22} {'F1':>6} {'P':>6} {'R':>6} "
-          f"{'MAE':>7} {'SAE_abs':>10} {'SAE_%':>7} {'TP':>6} {'FP':>6} {'TN':>6} {'FN':>6}")
+          f"{'MAE':>7} {'SAE_avg':>9} {'SAE_%':>7} {'TP':>6} {'FP':>6} {'TN':>6} {'FN':>6}")
     for app, m in metrics.items():
         print(f"    {app:<22} {m['f1']:>6.4f} {m['precision']:>6.4f} "
-              f"{m['recall']:>6.4f} {m['mae']:>7.2f} {m['sae_abs']:>10.1f} "
+              f"{m['recall']:>6.4f} {m['mae']:>7.2f} {m['sae_avg']:>9.2f} "
               f"{m['sae_ratio']:>7.4f} {m['TP']:>6} {m['FP']:>6} {m['TN']:>6} {m['FN']:>6}")
 
 
@@ -617,22 +624,29 @@ def run_all(dataset_dir=DEFAULT_DATASET_DIR, hidden_size=64, n_heads=2,
         for p in module.parameters():
             p.requires_grad = True
 
-    ft_opt     = torch.optim.Adam(
+    ft_opt        = torch.optim.Adam(
         filter(lambda p: p.requires_grad, model.parameters()), lr=LR_FT)
-    best_ft    = float('inf');  best_ft_state = None;  ft_counter = 0
-    ft_history = {'train_loss': []}
-    ft_start   = time.time()
+    best_ft_score = -float('inf');  best_ft_state = None;  ft_counter = 0
+    ft_history    = {'train_loss': []}
+    ft_start      = time.time()
 
     for epoch in range(EPOCHS_FT):
         ep_start = time.time()
         tr = _run_epoch(model, ft_loader, ft_opt, y_mins_t, y_ranges_t, device, True)
         ft_history['train_loss'].append(tr[0])
+
+        ft_m    = _metrics_per_appliance(tr[5], tr[6], tr[7], tr[8], y_scalers)
+        avg_f1  = float(np.mean([ft_m[a]['f1']  for a in APPLIANCES]))
+        avg_mae = float(np.mean([ft_m[a]['mae'] for a in APPLIANCES]))
+        score   = avg_f1 - 0.001 * avg_mae
+
         ep_time = time.time() - ep_start
         print(f"  FT Ep {epoch+1:2d}  loss={tr[0]:.5f}  "
               f"(reg={tr[1]:.4f} cls={tr[2]:.4f} sm={tr[3]:.4f} cs={tr[4]:.4f})  "
-              f"time={ep_time:.1f}s")
-        if tr[0] < best_ft:
-            best_ft = tr[0];  ft_counter = 0
+              f"avgF1={avg_f1:.4f}  avgMAE={avg_mae:.2f}  time={ep_time:.1f}s")
+
+        if score > best_ft_score:
+            best_ft_score = score;  ft_counter = 0
             best_ft_state = {k: v.clone() for k, v in model.state_dict().items()}
         else:
             ft_counter += 1
