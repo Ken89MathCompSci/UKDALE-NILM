@@ -66,7 +66,7 @@ WIN = 100;  STRIDE = 5;  BATCH = 32
 MASK_EPOCHS = 10;  MASK_LR = 5e-4;  MASK_RATIO = 0.15
 
 # Phase 1: supervised pretraining
-EPOCHS = 80;  PATIENCE = 20;  LR = 1e-3
+EPOCHS = 20;  PATIENCE = 5;  LR = 1e-3
 
 # Phase 2: fine-tuning
 EPOCHS_FT = 30;  PATIENCE_FT = 10;  LR_FT = 1e-4
@@ -85,9 +85,9 @@ FOCAL_GAMMA = 2.0;  FOCAL_ALPHA = 0.35   # moderate; 0.75 caused FP explosion on
 # Per-appliance classification thresholds (tuned for typical ON-rate differences)
 CLASS_THRESHOLDS = {
     'dishwasher':      0.35,
-    'fridge':          0.65,
-    'microwave':       0.85,   # rare event → requires high-confidence prediction
-    'washing_machine': 0.75,   # rare → requires high-confidence prediction
+    'fridge':          0.55,
+    'microwave':       0.30,
+    'washing_machine': 0.35,
 }
 
 # Improvement 3: TCN
@@ -283,26 +283,25 @@ def create_sequences(df):
 
 def _resplit_house5(ft_df, te_df):
     """
-    Concatenate House 5 splits, shuffle RESPLIT_CHUNK_MINUTES-sized chunks randomly,
-    assign RESPLIT_FT_RATIO of them to fine-tuning and the rest to test.
-    Random assignment prevents temporally-clustered appliance activity from landing
-    entirely in one split (the periodic-slice failure mode that causes all-ON splits).
+    Split the RAW dataframe first, then create sequences separately.
+    Splitting overlapping windows produces massive label leakage; splitting
+    raw rows before windowing is the statistically correct NILM pipeline.
     """
-    house5     = pd.concat([ft_df, te_df], ignore_index=True)
-    X, Yp, Yc, Yt, Ag = create_sequences(house5)
-    N          = len(X)
-    chunk_size = max(1, int(RESPLIT_CHUNK_MINUTES * 60 / STRIDE))
-    chunks     = [np.arange(start, min(start + chunk_size, N))
-                  for start in range(0, N, chunk_size)]
+    house5          = pd.concat([ft_df, te_df], ignore_index=True)
+    chunk_size_rows = int(RESPLIT_CHUNK_MINUTES * 60)
+    chunks = [house5.iloc[start:min(start + chunk_size_rows, len(house5))]
+              for start in range(0, len(house5), chunk_size_rows)]
     rng = np.random.default_rng(RESPLIT_SEED)
     rng.shuffle(chunks)
-    n_ft   = max(1, int(RESPLIT_FT_RATIO * len(chunks)))
-    ft_idx = np.concatenate(chunks[:n_ft])
-    te_idx = np.concatenate(chunks[n_ft:])
-    print(f"  House 5 re-split (random {RESPLIT_CHUNK_MINUTES}min chunks, "
-          f"seed={RESPLIT_SEED}): {len(ft_idx)} FT, {len(te_idx)} test windows")
-    return (X[ft_idx], Yp[ft_idx], Yc[ft_idx], Yt[ft_idx], Ag[ft_idx],
-            X[te_idx], Yp[te_idx], Yc[te_idx], Yt[te_idx], Ag[te_idx])
+    n_ft      = max(1, int(RESPLIT_FT_RATIO * len(chunks)))
+    ft_df_new = pd.concat(chunks[:n_ft], ignore_index=True)
+    te_df_new = pd.concat(chunks[n_ft:], ignore_index=True)
+    X_ft, Yp_ft, Yc_ft, Yt_ft, Ag_ft = create_sequences(ft_df_new)
+    X_te, Yp_te, Yc_te, Yt_te, Ag_te = create_sequences(te_df_new)
+    print(f"  House 5 re-split (raw {RESPLIT_CHUNK_MINUTES}min row-chunks, "
+          f"seed={RESPLIT_SEED}): {len(X_ft)} FT, {len(X_te)} test windows")
+    return (X_ft, Yp_ft, Yc_ft, Yt_ft, Ag_ft,
+            X_te, Yp_te, Yc_te, Yt_te, Ag_te)
 
 
 # ---------------------------------------------------------------------------
@@ -592,7 +591,7 @@ def run_all(dataset_dir=DEFAULT_DATASET_DIR, hidden_size=64, n_heads=2,
                   f"SAE_abs={m['sae_abs']:.1f}W  SAE%={m['sae_ratio']:.4f}  "
                   f"TP={m['TP']}  FP={m['FP']}  TN={m['TN']}  FN={m['FN']}")
 
-        score = avg_f1 - 0.001 * avg_mae
+        score = avg_f1
         if score > best_score:
             best_score = score;  counter = 0
             best_state = {k: v.clone() for k, v in model.state_dict().items()}
@@ -638,7 +637,7 @@ def run_all(dataset_dir=DEFAULT_DATASET_DIR, hidden_size=64, n_heads=2,
         ft_m    = _metrics_per_appliance(tr[5], tr[6], tr[7], tr[8], y_scalers)
         avg_f1  = float(np.mean([ft_m[a]['f1']  for a in APPLIANCES]))
         avg_mae = float(np.mean([ft_m[a]['mae'] for a in APPLIANCES]))
-        score   = avg_f1 - 0.001 * avg_mae
+        score   = avg_f1
 
         ep_time = time.time() - ep_start
         print(f"  FT Ep {epoch+1:2d}  loss={tr[0]:.5f}  "
