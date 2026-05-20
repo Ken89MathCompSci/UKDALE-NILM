@@ -71,6 +71,10 @@ EPOCHS = 80;  PATIENCE = 20;  LR = 1e-3
 # Phase 2: fine-tuning
 EPOCHS_FT = 30;  PATIENCE_FT = 10;  LR_FT = 1e-4
 
+# House 5 interleaved re-split (prevents all-ON/OFF pathological splits)
+FT_CHUNK_MINUTES = 5    # per cycle: assigned to fine-tuning
+TE_CHUNK_MINUTES = 30   # per cycle: assigned to test
+
 # Loss weights
 W_REG = 1.0;  W_CLS = 0.5;  W_SMOOTH = 0.1;  W_CONS = 0.05
 
@@ -276,6 +280,32 @@ def create_sequences(df):
     return X, Y_power, Y_class, Y_trans, Agg
 
 
+def _resplit_house5(ft_df, te_df):
+    """
+    Concatenate House 5 finetune+test splits then re-split with interleaved chunks.
+
+    Each cycle: FT_CHUNK_MINUTES → fine-tuning, TE_CHUNK_MINUTES → test.
+    Ensures every appliance's ON/OFF events appear in both splits, preventing
+    the degenerate case where one appliance is always ON (or always OFF) in a split.
+    """
+    house5    = pd.concat([ft_df, te_df], ignore_index=True)
+    X, Yp, Yc, Yt, Ag = create_sequences(house5)
+    N         = len(X)
+    cycle_seq = max(1, int((FT_CHUNK_MINUTES + TE_CHUNK_MINUTES) * 60 / STRIDE))
+    ft_seq    = max(1, int(FT_CHUNK_MINUTES * 60 / STRIDE))
+    ft_idx, te_idx = [], []
+    for start in range(0, N, cycle_seq):
+        for j in range(start, min(start + cycle_seq, N)):
+            if j - start < ft_seq:
+                ft_idx.append(j)
+            else:
+                te_idx.append(j)
+    print(f"  House 5 re-split: {len(ft_idx)} FT windows, {len(te_idx)} test windows "
+          f"({FT_CHUNK_MINUTES}min FT / {TE_CHUNK_MINUTES}min test per cycle)")
+    return (X[ft_idx], Yp[ft_idx], Yc[ft_idx], Yt[ft_idx], Ag[ft_idx],
+            X[te_idx], Yp[te_idx], Yc[te_idx], Yt[te_idx], Ag[te_idx])
+
+
 # ---------------------------------------------------------------------------
 # Improvement 4: Masked pretraining epoch
 # ---------------------------------------------------------------------------
@@ -387,8 +417,9 @@ def _metrics_per_appliance(pred_power_sc, pred_class_arr,
             pred_power_sc[:, i:i+1]).flatten()
         raw_true = y_scalers[i].inverse_transform(
             true_power_sc[:, i:i+1]).flatten()
-        mae = float(np.abs(raw_pred - raw_true).mean())
-        sae = float(abs(raw_pred.sum() - raw_true.sum()) / (raw_true.sum() + 1e-8))
+        mae       = float(np.abs(raw_pred - raw_true).mean())
+        sae_abs   = float(abs(raw_pred.sum() - raw_true.sum()))
+        sae_ratio = float(abs(raw_pred.sum() - raw_true.sum()) / (raw_true.sum() + 1e-8))
 
         # Classification metrics from the dedicated class head
         pred_on = pred_class_arr[:, i] > CLASS_THRESHOLDS[app]
@@ -403,7 +434,7 @@ def _metrics_per_appliance(pred_power_sc, pred_class_arr,
 
         results[app] = {
             'f1': float(f1), 'precision': float(precision), 'recall': float(recall),
-            'mae': mae, 'sae': sae,
+            'mae': mae, 'sae_abs': sae_abs, 'sae_ratio': sae_ratio,
             'TP': tp, 'FP': fp, 'TN': tn, 'FN': fn,
         }
     return results
@@ -412,11 +443,11 @@ def _metrics_per_appliance(pred_power_sc, pred_class_arr,
 def _print_metrics(label, metrics):
     print(f"  {label}")
     print(f"    {'App':<22} {'F1':>6} {'P':>6} {'R':>6} "
-          f"{'MAE':>7} {'SAE':>7} {'TP':>6} {'FP':>6} {'TN':>6} {'FN':>6}")
+          f"{'MAE':>7} {'SAE_abs':>10} {'SAE_%':>7} {'TP':>6} {'FP':>6} {'TN':>6} {'FN':>6}")
     for app, m in metrics.items():
         print(f"    {app:<22} {m['f1']:>6.4f} {m['precision']:>6.4f} "
-              f"{m['recall']:>6.4f} {m['mae']:>7.2f} {m['sae']:>7.4f} "
-              f"{m['TP']:>6} {m['FP']:>6} {m['TN']:>6} {m['FN']:>6}")
+              f"{m['recall']:>6.4f} {m['mae']:>7.2f} {m['sae_abs']:>10.1f} "
+              f"{m['sae_ratio']:>7.4f} {m['TP']:>6} {m['FP']:>6} {m['TN']:>6} {m['FN']:>6}")
 
 
 # ---------------------------------------------------------------------------
@@ -445,8 +476,9 @@ def run_all(dataset_dir=DEFAULT_DATASET_DIR, hidden_size=64, n_heads=2,
     # ── Sequences ─────────────────────────────────────────────────────────
     X_pre, Yp_pre, Yc_pre, Yt_pre, Ag_pre = create_sequences(splits['pretrain'])
     X_val, Yp_val, Yc_val, Yt_val, Ag_val = create_sequences(splits['validation'])
-    X_ft,  Yp_ft,  Yc_ft,  Yt_ft,  Ag_ft  = create_sequences(splits['finetune'])
-    X_te,  Yp_te,  Yc_te,  Yt_te,  Ag_te  = create_sequences(splits['test'])
+    (X_ft, Yp_ft, Yc_ft, Yt_ft, Ag_ft,
+     X_te, Yp_te, Yc_te, Yt_te, Ag_te) = _resplit_house5(
+        splits['finetune'], splits['test'])
 
     print("\nClass balance (fraction ON per appliance):")
     print(f"  {'App':<22} {'pretrain':>10} {'val':>10} {'finetune':>10} {'test':>10}")
@@ -549,7 +581,8 @@ def run_all(dataset_dir=DEFAULT_DATASET_DIR, hidden_size=64, n_heads=2,
         for app in APPLIANCES:
             m = vm[app]
             print(f"    {app:<22}  F1={m['f1']:.4f}  P={m['precision']:.4f}  "
-                  f"R={m['recall']:.4f}  MAE={m['mae']:.2f}  SAE={m['sae']:.4f}  "
+                  f"R={m['recall']:.4f}  MAE={m['mae']:.2f}  "
+                  f"SAE_abs={m['sae_abs']:.1f}W  SAE%={m['sae_ratio']:.4f}  "
                   f"TP={m['TP']}  FP={m['FP']}  TN={m['TN']}  FN={m['FN']}")
 
         score = avg_f1 - 0.001 * avg_mae
