@@ -48,7 +48,7 @@ from datetime import datetime
 from sklearn.preprocessing import MinMaxScaler
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'Source Code'))
-from utils import calculate_nilm_metrics, save_model
+from utils import save_model
 
 
 # ---------------------------------------------------------------------------
@@ -306,7 +306,8 @@ def _run_epoch(model, loader, optimizer, y_mins_t, y_ranges_t, device, train=Tru
     """Phase 1/2: multi-task supervised training with focal BCE."""
     model.train() if train else model.eval()
     tot = tot_reg = tot_cls = tot_smooth = tot_cons = 0.0
-    all_pred, all_true = [], []
+    all_pred_power, all_pred_class = [], []
+    all_true_power, all_true_class = [], []
 
     ctx = torch.enable_grad() if train else torch.no_grad()
     with ctx:
@@ -347,27 +348,49 @@ def _run_epoch(model, loader, optimizer, y_mins_t, y_ranges_t, device, train=Tru
             tot_cls    += L_cls.item()
             tot_smooth += L_smooth.item()
             tot_cons   += L_cons.item()
-            all_pred.append(pred_power.detach().cpu().numpy())
-            all_true.append(yb_pw.cpu().numpy())
+            all_pred_power.append(pred_power.detach().cpu().numpy())
+            all_pred_class.append(pred_class.detach().cpu().numpy())
+            all_true_power.append(yb_pw.cpu().numpy())
+            all_true_class.append(yb_cl.cpu().numpy())
 
     n = len(loader)
     return (tot/n, tot_reg/n, tot_cls/n, tot_smooth/n, tot_cons/n,
-            np.concatenate(all_pred), np.concatenate(all_true))
+            np.concatenate(all_pred_power), np.concatenate(all_pred_class),
+            np.concatenate(all_true_power), np.concatenate(all_true_class))
 
 
-def _metrics_per_appliance(pred_scaled, true_scaled, y_scalers):
+def _metrics_per_appliance(pred_power_sc, pred_class_arr,
+                           true_power_sc, true_class_arr, y_scalers):
+    """
+    F1 / P / R / TP / FP / TN / FN  ← classification head  (pred_class > 0.5)
+    MAE / SAE                         ← regression head     (inverse-scaled power)
+    """
     results = {}
     for i, app in enumerate(APPLIANCES):
+        # Regression metrics
         raw_pred = y_scalers[i].inverse_transform(
-            pred_scaled[:, i:i+1]).flatten()
+            pred_power_sc[:, i:i+1]).flatten()
         raw_true = y_scalers[i].inverse_transform(
-            true_scaled[:, i:i+1]).flatten()
-        m = calculate_nilm_metrics(raw_true, raw_pred, threshold=THRESHOLD)
-        m['TP'] = int(((raw_true > THRESHOLD) &  (raw_pred > THRESHOLD)).sum())
-        m['FP'] = int(((raw_true <= THRESHOLD) & (raw_pred > THRESHOLD)).sum())
-        m['TN'] = int(((raw_true <= THRESHOLD) & (raw_pred <= THRESHOLD)).sum())
-        m['FN'] = int(((raw_true > THRESHOLD)  & (raw_pred <= THRESHOLD)).sum())
-        results[app] = m
+            true_power_sc[:, i:i+1]).flatten()
+        mae = float(np.abs(raw_pred - raw_true).mean())
+        sae = float(abs(raw_pred.sum() - raw_true.sum()) / (raw_true.sum() + 1e-8))
+
+        # Classification metrics from the dedicated class head
+        pred_on = pred_class_arr[:, i] > 0.5
+        true_on = true_class_arr[:, i] > 0.5
+        tp = int(( pred_on &  true_on).sum())
+        fp = int(( pred_on & ~true_on).sum())
+        tn = int((~pred_on & ~true_on).sum())
+        fn = int((~pred_on &  true_on).sum())
+        precision = tp / (tp + fp + 1e-8)
+        recall    = tp / (tp + fn + 1e-8)
+        f1        = 2.0 * precision * recall / (precision + recall + 1e-8)
+
+        results[app] = {
+            'f1': float(f1), 'precision': float(precision), 'recall': float(recall),
+            'mae': mae, 'sae': sae,
+            'TP': tp, 'FP': fp, 'TN': tn, 'FN': fn,
+        }
     return results
 
 
@@ -485,7 +508,7 @@ def run_all(dataset_dir=DEFAULT_DATASET_DIR, hidden_size=64, n_heads=2,
         va = _run_epoch(model, val_loader, None,      y_mins_t, y_ranges_t, device, False)
         scheduler.step(va[0])
 
-        vm     = _metrics_per_appliance(va[5], va[6], y_scalers)
+        vm     = _metrics_per_appliance(va[5], va[6], va[7], va[8], y_scalers)
         avg_f1 = np.mean([vm[a]['f1']  for a in APPLIANCES])
         avg_mae= np.mean([vm[a]['mae'] for a in APPLIANCES])
 
@@ -526,7 +549,7 @@ def run_all(dataset_dir=DEFAULT_DATASET_DIR, hidden_size=64, n_heads=2,
     model.load_state_dict(best_state)
 
     pre_ft     = _run_epoch(model, te_loader, None, y_mins_t, y_ranges_t, device, False)
-    pre_ft_met = _metrics_per_appliance(pre_ft[5], pre_ft[6], y_scalers)
+    pre_ft_met = _metrics_per_appliance(pre_ft[5], pre_ft[6], pre_ft[7], pre_ft[8], y_scalers)
     _print_metrics("Test BEFORE fine-tune:", pre_ft_met)
 
     # ── Phase 2: Fine-tune ────────────────────────────────────────────────
@@ -557,7 +580,7 @@ def run_all(dataset_dir=DEFAULT_DATASET_DIR, hidden_size=64, n_heads=2,
 
     # ── Phase 3: Test ─────────────────────────────────────────────────────
     te       = _run_epoch(model, te_loader, None, y_mins_t, y_ranges_t, device, False)
-    test_met = _metrics_per_appliance(te[5], te[6], y_scalers)
+    test_met = _metrics_per_appliance(te[5], te[6], te[7], te[8], y_scalers)
     _print_metrics("Test AFTER fine-tune:", test_met)
 
     # ── Plots ─────────────────────────────────────────────────────────────
