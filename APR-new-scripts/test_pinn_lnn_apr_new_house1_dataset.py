@@ -4,12 +4,15 @@ Physics-Informed LNN (PINN-LNN) for NILM — APR-new-House1-dataset splits.
 Derived from test_pinn_lnn_apr_dataset.py with one change:
 
 1. DATA SOURCE — reads directly from APR-new-House1-dataset/ CSV files:
-       APR-new-House1-dataset/UKDALE_HF_train.csv      (House 1, 2015-12-22)
-       APR-new-House1-dataset/UKDALE_HF_validation.csv (House 1, 2014-10-11)
-       APR-new-House1-dataset/UKDALE_HF_test.csv       (House 1, 2016-01-22)
-   All three splits are House 1 — no cross-house domain shift, no standby artefact.
-   These are different calendar days than APR-dataset/, selected for strong,
-   balanced activity across dishwasher/microwave/washing_machine.
+       APR-new-House1-dataset/UKDALE_HF_train.csv      (House 1, 2014-09-08 to 2014-10-07, 30 days)
+       APR-new-House1-dataset/UKDALE_HF_validation.csv (House 1, 2014-10-08 to 2014-10-14, 7 days)
+       APR-new-House1-dataset/UKDALE_HF_test.csv       (House 1, 2014-10-15 to 2014-10-21, 7 days)
+   All three splits are House 1, chronologically contiguous (no gap/overlap
+   between them) — no cross-house domain shift, no standby artefact.
+   Multi-day splits (vs. APR-dataset's single-day splits) were chosen to give
+   rare appliances (microwave, washing_machine) enough positive windows to
+   learn a clean decision boundary; single-day splits produced degenerate
+   high-recall/low-precision models.
    Columns: timestamp, aggregate, dishwasher, fridge, microwave, washing_machine
 
 Everything else (architecture, losses, thresholds, training loop) is unchanged
@@ -453,7 +456,7 @@ def train_pinn_model(data_dict, save_dir,
     _plot_training(history, test_metrics, save_dir)
 
     config = {
-        'dataset': 'APR-new-House1-dataset (H1 train Dec-22-2015 / val Oct-11-2014 / test Jan-22-2016)',
+        'dataset': 'APR-new-House1-dataset (H1 train 2014-09-08..10-07 / val 10-08..10-14 / test 10-15..10-21)',
         'model': 'PhysicsInformedLiquidNetworkModel',
         'description': 'adaptive LNN (adaptive tau + input gate) + L_phys; all House 1, 10 W threshold',
         'loss': f'MSE + {lambda_phys} * PhysicsConsistency(epsilon={epsilon_w}W) [stage2 only]',
