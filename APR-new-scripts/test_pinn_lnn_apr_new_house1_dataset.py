@@ -15,7 +15,23 @@ Derived from test_pinn_lnn_apr_dataset.py with one change:
    high-recall/low-precision models.
    Columns: timestamp, aggregate, dishwasher, fridge, microwave, washing_machine
 
-Everything else (architecture, losses, thresholds, training loop) is unchanged
+2. LOSS REWEIGHTING — the first multi-day run collapsed dishwasher performance
+   (F1 0.48 -> 0.04) even though fridge/microwave/washing_machine all improved.
+   Cause: 12 of the 30 training days (40%) have zero dishwasher activity, so in
+   the shared-encoder joint MSE, dishwasher's already-weak gradient gets
+   drowned out by fridge (on ~49% of the time, always present) and
+   washing_machine. Two fixes:
+     a) Per-appliance MSE loss weighting -- weights are set to
+        sqrt(1 / train_on_rate), normalized to mean 1.0 and clipped to
+        [0.2, 5.0], computed once from the actual training split (see
+        MSE_WEIGHTS in train_pinn_model). Rare appliances (dishwasher,
+        microwave) get amplified gradient; the ever-present fridge gets damped.
+        Validation/early-stopping still uses the plain (unweighted) MSE so
+        model selection isn't skewed by the same reweighting.
+     b) Dishwasher's BCE_LAMBDA raised 0.5 -> 1.0 and BCE_ALPHA (positive-class
+        weight) raised 2.0 -> 4.0, to push harder on recovering recall.
+
+Everything else (architecture, thresholds, training loop) is unchanged
 from test_pinn_lnn_apr_dataset.py:
 
 Architecture:
@@ -75,8 +91,11 @@ THRESHOLDS = {
     'washing_machine': 10.0,
 }
 
-BCE_LAMBDA = {'dishwasher': 0.5, 'fridge': 0.3, 'microwave': 0.0, 'washing_machine': 0.0}
-BCE_ALPHA  = {'dishwasher': 2.0, 'fridge': 2.0, 'microwave': 1.0, 'washing_machine': 1.0}
+# Dishwasher raised (0.5->1.0 / 2.0->4.0): 40% of training days have zero
+# dishwasher activity, so its recall needs stronger BCE pressure to recover
+# from being drowned out by the always-present fridge/washing_machine.
+BCE_LAMBDA = {'dishwasher': 1.0, 'fridge': 0.3, 'microwave': 0.0, 'washing_machine': 0.0}
+BCE_ALPHA  = {'dishwasher': 4.0, 'fridge': 2.0, 'microwave': 1.0, 'washing_machine': 1.0}
 
 DATASET_DIR = os.path.join(os.path.dirname(__file__), '..', 'APR-new-House1-dataset')
 
@@ -261,6 +280,21 @@ def train_pinn_model(data_dict, save_dir,
     X_va, Y_va = create_sequences(data_dict['val'],   WIN)
     X_te, Y_te = create_sequences(data_dict['test'],  WIN)
 
+    # Per-appliance MSE loss weights, computed from the (unscaled) training
+    # targets before Y_tr gets overwritten by scaling below. sqrt-inverse-
+    # frequency, normalized to mean 1.0, clipped to keep training stable.
+    train_on_rates = {
+        app: float((Y_tr[:, i] > THRESHOLDS[app]).mean())
+        for i, app in enumerate(APPLIANCES)
+    }
+    raw_weights = {app: (1.0 / max(train_on_rates[app], 1e-4)) ** 0.5 for app in APPLIANCES}
+    mean_w = sum(raw_weights.values()) / len(raw_weights)
+    MSE_WEIGHTS = {app: float(np.clip(raw_weights[app] / mean_w, 0.2, 5.0)) for app in APPLIANCES}
+    mse_weight_tensor = torch.tensor(
+        [MSE_WEIGHTS[app] for app in APPLIANCES], dtype=torch.float32, device=device)
+    print(f"Train ON-rate:  { {a: round(train_on_rates[a]*100, 2) for a in APPLIANCES} }")
+    print(f"MSE weights:    { {a: round(MSE_WEIGHTS[a], 3) for a in APPLIANCES} }")
+
     x_scaler = MinMaxScaler()
     X_tr = x_scaler.fit_transform(X_tr.reshape(-1, 1)).reshape(X_tr.shape)
     X_va = x_scaler.transform(X_va.reshape(-1, 1)).reshape(X_va.shape)
@@ -329,11 +363,13 @@ def train_pinn_model(data_dict, save_dir,
 
             pred      = model(xb)
             mse_loss  = mse_criterion(pred, yb)
+            per_app_mse       = ((pred - yb) ** 2).mean(dim=0)          # (n_appliances,)
+            weighted_mse_loss = (per_app_mse * mse_weight_tensor).mean()
             x_mid     = xb[:, WIN // 2, 0]
             phys_loss = phys_criterion(x_mid, pred)
 
             if epoch < WARMUP_EPOCHS:
-                loss = mse_loss
+                loss = weighted_mse_loss
             else:
                 bce_loss = torch.tensor(0.0, device=device)
                 for i, app in enumerate(APPLIANCES):
@@ -346,7 +382,7 @@ def train_pinn_model(data_dict, save_dir,
                                              torch.ones_like(y_bin))
                         bce_loss = bce_loss + BCE_LAMBDA[app] * F.binary_cross_entropy(
                             pred_i, y_bin, weight=w)
-                loss = mse_loss + lambda_phys * phys_loss + bce_loss
+                loss = weighted_mse_loss + lambda_phys * phys_loss + bce_loss
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -459,9 +495,15 @@ def train_pinn_model(data_dict, save_dir,
         'dataset': 'APR-new-House1-dataset (H1 train 2014-09-08..10-07 / val 10-08..10-14 / test 10-15..10-21)',
         'model': 'PhysicsInformedLiquidNetworkModel',
         'description': 'adaptive LNN (adaptive tau + input gate) + L_phys; all House 1, 10 W threshold',
-        'loss': f'MSE + {lambda_phys} * PhysicsConsistency(epsilon={epsilon_w}W) [stage2 only]',
+        'loss': f'weighted-MSE (per-appliance, see mse_weights) + '
+                f'{lambda_phys} * PhysicsConsistency(epsilon={epsilon_w}W) [stage2 only] '
+                f'+ weighted BCE (see bce_lambda/bce_alpha) [stage2 only]',
         'window_size': WIN,
         'thresholds': THRESHOLDS,
+        'train_on_rates': train_on_rates,
+        'mse_weights': MSE_WEIGHTS,
+        'bce_lambda': BCE_LAMBDA,
+        'bce_alpha': BCE_ALPHA,
         'model_params': {
             'input_size': 1, 'hidden_size': hidden_size,
             'n_appliances': len(APPLIANCES), 'dt': dt,
