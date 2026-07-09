@@ -21,11 +21,18 @@ Derived from test_pinn_lnn_apr_dataset.py with one change:
    the shared-encoder joint MSE, dishwasher's already-weak gradient gets
    drowned out by fridge (on ~49% of the time, always present) and
    washing_machine. Two fixes:
-     a) Per-appliance MSE loss weighting -- weights are set to
-        sqrt(1 / train_on_rate), normalized to mean 1.0 and clipped to
-        [0.2, 5.0], computed once from the actual training split (see
-        MSE_WEIGHTS in train_pinn_model). Rare appliances (dishwasher,
-        microwave) get amplified gradient; the ever-present fridge gets damped.
+     a) Per-appliance MSE loss weighting -- weights start as
+        sqrt(1 / train_on_rate), normalized to mean 1.0, computed once from
+        the actual training split (see MSE_WEIGHTS in train_pinn_model).
+        Rare appliances (dishwasher, microwave) get amplified gradient; the
+        ever-present fridge (~49% ON) gets damped. Every appliance except
+        fridge is then floored at 1.0 -- the first version of this reweighting
+        normalized to mean=1 without a floor, which let dishwasher's/
+        microwave's large boosts drag washing_machine's weight below 1.0 too
+        (0.80x) even though it wasn't the appliance causing the imbalance;
+        that regressed washing_machine's F1 (0.52 -> 0.44) in that run. With
+        the floor, fridge is the only appliance that can be damped below its
+        original contribution. Final clip to [0.2, 5.0] for stability.
         Validation/early-stopping still uses the plain (unweighted) MSE so
         model selection isn't skewed by the same reweighting.
      b) Dishwasher's BCE_LAMBDA raised 0.5 -> 1.0 and BCE_ALPHA (positive-class
@@ -287,9 +294,21 @@ def train_pinn_model(data_dict, save_dir,
         app: float((Y_tr[:, i] > THRESHOLDS[app]).mean())
         for i, app in enumerate(APPLIANCES)
     }
+    # Floor every appliance except 'fridge' at 1.0 after normalizing: fridge
+    # (on ~49% of the time, always present) is the one actually crowding out
+    # the others, so it's the only appliance allowed to be damped below its
+    # original unweighted contribution. Without this floor, normalizing to
+    # mean=1 let dishwasher's/microwave's large boosts drag washing_machine's
+    # weight below 1.0 too even though it wasn't the appliance causing the
+    # imbalance -- that regressed washing_machine in the first reweighted run.
     raw_weights = {app: (1.0 / max(train_on_rates[app], 1e-4)) ** 0.5 for app in APPLIANCES}
     mean_w = sum(raw_weights.values()) / len(raw_weights)
-    MSE_WEIGHTS = {app: float(np.clip(raw_weights[app] / mean_w, 0.2, 5.0)) for app in APPLIANCES}
+    MSE_WEIGHTS = {}
+    for app in APPLIANCES:
+        w = raw_weights[app] / mean_w
+        if app != 'fridge':
+            w = max(w, 1.0)
+        MSE_WEIGHTS[app] = float(np.clip(w, 0.2, 5.0))
     mse_weight_tensor = torch.tensor(
         [MSE_WEIGHTS[app] for app in APPLIANCES], dtype=torch.float32, device=device)
     print(f"Train ON-rate:  { {a: round(train_on_rates[a]*100, 2) for a in APPLIANCES} }")
