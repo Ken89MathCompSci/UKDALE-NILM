@@ -587,7 +587,7 @@ def train(data_dict: dict, save_dir: str,
         for app in APPLIANCES:
             m = vm[app]
             print(f"    {app:<18}  F1={m['f1']:.4f}  P={m['precision']:.4f}  "
-                  f"R={m['recall']:.4f}  MAE={m['mae']:.2f}  "
+                  f"R={m['recall']:.4f}  MAE={m['mae']:.2f}  SAE={m['sae']:.4f}  "
                   f"TP={m['tp']:,d}  TN={m['tn']:,d}  FP={m['fp']:,d}  FN={m['fn']:,d}")
 
         if avg_va_mse < best_val_mse:
@@ -619,12 +619,12 @@ def train(data_dict: dict, save_dir: str,
     test_metrics  = per_app_metrics(true_trace_te, pred_trace_te, y_scalers, te_thr)
 
     print(f"\n{'Appliance':<18} {'F1':>7} {'Prec':>7} {'Rec':>7} "
-          f"{'MAE':>7} {'TP':>7} {'TN':>7} {'FP':>7} {'FN':>7}")
-    print("-" * 77)
+          f"{'MAE':>7} {'SAE':>7} {'TP':>7} {'TN':>7} {'FP':>7} {'FN':>7}")
+    print("-" * 85)
     for app in APPLIANCES:
         m = test_metrics[app]
         print(f"{app:<18} {m['f1']:>7.4f} {m['precision']:>7.4f} {m['recall']:>7.4f} "
-              f"{m['mae']:>7.2f} {m['tp']:>7,d} {m['tn']:>7,d} "
+              f"{m['mae']:>7.2f} {m['sae']:>7.4f} {m['tp']:>7,d} {m['tn']:>7,d} "
               f"{m['fp']:>7,d} {m['fn']:>7,d}")
 
     # -- Save checkpoint + config --
@@ -682,17 +682,21 @@ def _plot_loss(history, save_dir):
 
 def _plot_metrics(history, test_metrics, save_dir):
     ep = range(1, len(history['train_loss']) + 1)
-    fig, axes = plt.subplots(len(APPLIANCES), 2, figsize=(12, 4 * len(APPLIANCES)))
+    fig, axes = plt.subplots(len(APPLIANCES), 3, figsize=(17, 4 * len(APPLIANCES)))
     fig.suptitle('CombinedPINNAdvancedLNN (APR-new-House1-dataset) -- Per-Appliance Validation Metrics')
     for row, app in enumerate(APPLIANCES):
         f1s  = [m[app]['f1']  for m in history['val_metrics']]
         maes = [m[app]['mae'] for m in history['val_metrics']]
+        saes = [m[app]['sae'] for m in history['val_metrics']]
         axes[row][0].plot(ep, f1s, color='steelblue')
         axes[row][0].axhline(test_metrics[app]['f1'], color='green', linestyle='--', label='Test')
         axes[row][0].set_title(f'{app} -- F1'); axes[row][0].legend(); axes[row][0].grid(alpha=0.3)
         axes[row][1].plot(ep, maes, color='tomato')
         axes[row][1].axhline(test_metrics[app]['mae'], color='green', linestyle='--', label='Test')
         axes[row][1].set_title(f'{app} -- MAE (W)'); axes[row][1].legend(); axes[row][1].grid(alpha=0.3)
+        axes[row][2].plot(ep, saes, color='purple')
+        axes[row][2].axhline(test_metrics[app]['sae'], color='green', linestyle='--', label='Test')
+        axes[row][2].set_title(f'{app} -- SAE'); axes[row][2].legend(); axes[row][2].grid(alpha=0.3)
     plt.tight_layout()
     plt.savefig(os.path.join(save_dir, 'combined_pinn_lnn_apr_new_house1_dataset_per_appliance.png'),
                 dpi=150, bbox_inches='tight')
