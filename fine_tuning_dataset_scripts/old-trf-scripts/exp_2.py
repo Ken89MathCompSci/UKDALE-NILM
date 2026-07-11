@@ -1,0 +1,201 @@
+
+import argparse
+import os
+import json
+
+import numpy as np
+
+
+from sklearn.model_selection import train_test_split
+from collections import Counter
+from sklearn.preprocessing import LabelEncoder
+from dataset.load_cooll_data import *
+from dataset.load_whited_data import *
+from dataset.load_redd_data import *
+from sklearn.metrics import recall_score, precision_score, f1_score, accuracy_score
+from sklearn.ensemble import RandomForestClassifier
+from dataset.load_plaid_data import leave_one_house_out_plaid, split_tune_set, split_tune_set_percentage
+from SER.WeightedRF import WeightedRandomForest
+
+
+def sample_from_large_categories(Xt, yt, n_samples=1):
+    # houses = dict([(key, []) for key in range(n)])
+    # houses_ids = dict([(key, []) for key in range(n)])
+    wanted_appl = np.unique(yt)
+
+    idx = []
+    for name in wanted_appl:
+        appl_idx = np.where(yt == name)[0]
+        for i in range(0, len(appl_idx), 10):
+            appl_idx_i = np.random.choice(appl_idx[i:i+10], n_samples, replace=False)
+            idx.append(appl_idx_i)
+
+    idx = np.array(idx).flatten()
+    Xtune, ytune = Xt[idx], yt[idx]
+    Xtune, ytune = Xtune.reshape(len(idx), -1), ytune.reshape(-1)
+
+    # mask = np.ones(len(Xt), dtype=bool)
+    # mask[idx] = False  # Set positions in idx to False
+
+    Xtest, ytest = np.delete(Xt, idx, axis=0), np.delete(yt, idx, axis=0)
+    # Xtest, Xtune_r, ytest, ytune_r
+    return Xtest, Xtune, ytest, ytune
+
+
+def exp_case2_transfer(args, input_feature, label, dataset, house_label=None, amount_houses_test=1):
+    classes = list(np.unique(label))
+    num_class = len(classes)
+
+    if dataset == "whited":
+        data = generate_dataset_whited(label, input_feature)
+        train_set, test_set = get_train_test_leave_out_whited(data, 9)
+        n = len(train_set)
+
+    if dataset == "cooll":
+        data = generate_image_label_pair(label, input_feature)
+        train_set, test_set = get_train_test_leave_out_cooll(data, 8)
+        n = len(train_set)
+
+    if dataset == "plaid":
+        houses = np.unique(house_label)
+        n = len(houses)
+    
+    if dataset == "redd":
+        # For REDD, we have only one house (House 3), so we'll do a simple train-test split
+        n = 1
+
+    # Number of Leave-one-house-out
+    for i in range(n):
+        if dataset == "plaid":
+            Xtrain, Xtest, ytrain, ytest, house_label_test = leave_one_house_out_plaid(house_label, label, input_feature, amount_houses_test=1)
+
+        if dataset in ["whited", "cooll"]:
+            Xtrain, ytrain, Xtest, ytest = get_train_test_data(train_set, test_set, idx=i)
+        
+        if dataset == "redd":
+            # Use our properly extracted training, validation, and testing datasets
+            # Load training dataset
+            Xtrain = np.load(f"src/data/{args.dataset}/training_datasets/X.npy")
+            ytrain = np.load(f"src/data/{args.dataset}/training_datasets/Y.npy")
+            
+            # Load validation dataset  
+            X_val = np.load(f"src/data/{args.dataset}/validation_datasets/X.npy")
+            y_val = np.load(f"src/data/{args.dataset}/validation_datasets/Y.npy")
+            
+            # Load testing dataset (cross-house evaluation: House 1)
+            Xtest = np.load(f"src/data/{args.dataset}/testing_datasets/X.npy")
+            ytest = np.load(f"src/data/{args.dataset}/testing_datasets/Y.npy")
+            
+            print(f"REDD Data Loaded:")
+            print(f"  Training: {Xtrain.shape[0]} samples from House 3")
+            print(f"  Validation: {X_val.shape[0]} samples from House 3")
+            print(f"  Testing: {Xtest.shape[0]} samples from House 1 (cross-house)")
+
+        if dataset != "redd":
+            le = LabelEncoder()
+            ytrain = le.fit_transform(ytrain)
+            ytest = le.transform(ytest)
+
+            Xtrain, X_val, ytrain, y_val = train_test_split(Xtrain, ytrain, test_size=0.2, stratify=ytrain)
+
+        """for others """
+        if dataset == "plaid":
+            X_tune, y_tune, _, Xtest, ytest, _ = split_tune_set(Xtest, ytest, house_label_test, args.k_target)
+        else:
+            Xtest, X_tune, ytest, y_tune = sample_from_large_categories(Xtest, ytest, n_samples=args.k_target)
+
+        # label encoding
+        src_model = RandomForestClassifier(n_estimators=args.tree)
+
+        src_model.fit(Xtrain, ytrain)
+        tgt_model = WeightedRandomForest(src_model, n_update=0.8, w_new=0.8, original_ser=False)
+        tgt_model.update_forest(X_tune, y_tune)
+
+        yt_pred = tgt_model.predict(Xtest)
+
+        results = {
+            "Target": {
+                "Accuracy": float(accuracy_score(ytest, yt_pred) * 100),
+                "F1_macro": float(f1_score(ytest, yt_pred, average="macro") * 100),
+                "Precision": float(precision_score(ytest, yt_pred, average="macro") * 100),
+                "Recall": float(recall_score(ytest, yt_pred, average="macro") * 100),
+                "Number of samples": len(ytest)
+            }
+        }
+
+        file_path = f"results/{str(args.dataset)}/kt_{str(args.k_target)}_ori/WTRF_{str(i)}.json"
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        with open(file_path, 'w') as f:
+            json.dump(results, f, indent=4, separators=(",", ": "))
+            
+        # For REDD, also evaluate on the full testing dataset (House 1) and save separately
+        if dataset == "redd":
+            # Load the full testing dataset
+            X_test_full = np.load(f"src/data/{args.dataset}/testing_datasets/X.npy")
+            y_test_full = np.load(f"src/data/{args.dataset}/testing_datasets/Y.npy")
+            
+            # Make predictions on full testing dataset
+            y_test_pred_full = tgt_model.predict(X_test_full)
+            
+            test_results = {
+                "Testing_Dataset_Results": {
+                    "Description": "Cross-house evaluation: Model trained on House 3, tested on House 1",
+                    "Training_samples": len(ytrain),
+                    "Testing_samples": len(y_test_full),
+                    "Accuracy": float(accuracy_score(y_test_full, y_test_pred_full) * 100),
+                    "F1_macro": float(f1_score(y_test_full, y_test_pred_full, average="macro") * 100),
+                    "Precision": float(precision_score(y_test_full, y_test_pred_full, average="macro") * 100),
+                    "Recall": float(recall_score(y_test_full, y_test_pred_full, average="macro") * 100),
+                    "Number of samples": len(y_test_full)
+                }
+            }
+            
+            # Save testing results to separate file
+            test_file_path = f"results/{str(args.dataset)}/kt_{str(args.k_target)}_ori/TESTING_RESULTS_{str(i)}.json"
+            with open(test_file_path, 'w') as f:
+                json.dump(test_results, f, indent=4, separators=(",", ": "))
+            
+            print(f"Testing Results:")
+            print(f"  - Full Testing Dataset: {len(y_test_full)} samples from House 1")
+            print(f"  - Cross-house Accuracy: {test_results['Testing_Dataset_Results']['Accuracy']:.2f}%")
+            print(f"  - Results saved to: {test_file_path}")
+
+
+parser = argparse.ArgumentParser("Training")
+# Dataset
+parser.add_argument('--dataset', type=str, default='whited', help="plaid, whited, cooll")
+parser.add_argument('--dataroot', type=str, default='./data')
+parser.add_argument('--outf', type=str, default='./log')
+parser.add_argument('--pre_save', type=bool, default=True)
+parser.add_argument('--k_source', type=int, default=0)
+parser.add_argument('--k_target', type=int, default=1)
+parser.add_argument('--exp_num', type=int, default=1)
+parser.add_argument('--amount_houses_test', type=int, default=1)
+parser.add_argument('--beta', type=int, default=1)
+parser.add_argument('--tree', type=int, default=9, help="number of trees")
+parser.add_argument('--n_update', type=int, default=0.8)
+
+
+args = parser.parse_args()
+
+if __name__ == '__main__':
+    print("start...")
+
+    print("Starting generalization experiment...")
+    print(f"Loading {args.dataset} dataset...")
+
+    data = np.load(f"data/{args.dataset}/X.npy")        # features
+    labels = np.load(f"data/{args.dataset}/Y.npy")
+    if args.dataset == "plaid":
+        house_label = np.load(f"data/{args.dataset}/house_label.npy", allow_pickle=True)
+    else:
+        house_label = None
+
+    # sample_from_large_categories(data_2, labels_2)
+    # for num in range(0, 21):
+    exp_case2_transfer(args=args, input_feature=data,
+                       label=labels,
+                       dataset=args.dataset,
+                       house_label=house_label,
+                       amount_houses_test=args.amount_houses_test)
+        # args.exp_num += 1
