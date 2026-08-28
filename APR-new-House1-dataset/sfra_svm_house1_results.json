@@ -1,0 +1,126 @@
+{
+  "note": "Proxy-SFRA (FFT of aggregate power windows), NOT real SFRA -- see module docstring.",
+  "window": {
+    "win_minutes": 6.0,
+    "train_stride_minutes": 3.0,
+    "on_fraction_threshold": 0.05
+  },
+  "thresholds_w": {
+    "dishwasher": 21.0,
+    "fridge": 10.0,
+    "microwave": 21.0,
+    "washing_machine": 23.0
+  },
+  "svm_params": {
+    "backend": "approx",
+    "degree": 3,
+    "coef0": 1.0,
+    "C": 1.0,
+    "kernel": "poly",
+    "n_components": 300,
+    "alpha": 0.0001,
+    "class_weight": null
+  },
+  "max_train_windows": null,
+  "train_windows_used": 14399,
+  "val": {
+    "per_appliance": {
+      "dishwasher": {
+        "precision": 0.11627906976744186,
+        "recall": 0.1724137931034483,
+        "f1": 0.1388888888888889,
+        "tp": 10,
+        "fp": 76,
+        "fn": 48,
+        "tn": 1546
+      },
+      "fridge": {
+        "precision": 0.6738382099827883,
+        "recall": 0.7941176470588235,
+        "f1": 0.7290502793296089,
+        "tp": 783,
+        "fp": 379,
+        "fn": 203,
+        "tn": 315
+      },
+      "microwave": {
+        "precision": 0.5425531914893617,
+        "recall": 0.6219512195121951,
+        "f1": 0.5795454545454546,
+        "tp": 51,
+        "fp": 43,
+        "fn": 31,
+        "tn": 1555
+      },
+      "washing_machine": {
+        "precision": 0.9099099099099099,
+        "recall": 0.7651515151515151,
+        "f1": 0.831275720164609,
+        "tp": 101,
+        "fp": 10,
+        "fn": 31,
+        "tn": 1538
+      }
+    },
+    "micro": {
+      "precision": 0.6503785271851342,
+      "recall": 0.7511923688394276,
+      "f1": 0.6971597196606418
+    },
+    "macro": {
+      "precision": 0.5606450952873755,
+      "recall": 0.5884085437064955,
+      "f1": 0.5741914091026932
+    }
+  },
+  "test": {
+    "per_appliance": {
+      "dishwasher": {
+        "precision": 0.03333333333333333,
+        "recall": 0.08108108108108109,
+        "f1": 0.04724409448818898,
+        "tp": 3,
+        "fp": 87,
+        "fn": 34,
+        "tn": 1556
+      },
+      "fridge": {
+        "precision": 0.6927816901408451,
+        "recall": 0.7700587084148728,
+        "f1": 0.7293790546802595,
+        "tp": 787,
+        "fp": 349,
+        "fn": 235,
+        "tn": 309
+      },
+      "microwave": {
+        "precision": 0.6,
+        "recall": 0.6375,
+        "f1": 0.6181818181818182,
+        "tp": 51,
+        "fp": 34,
+        "fn": 29,
+        "tn": 1566
+      },
+      "washing_machine": {
+        "precision": 0.8409090909090909,
+        "recall": 0.7070063694267515,
+        "f1": 0.7681660899653979,
+        "tp": 111,
+        "fp": 21,
+        "fn": 46,
+        "tn": 1502
+      }
+    },
+    "micro": {
+      "precision": 0.6597366597366597,
+      "recall": 0.7345679012345679,
+      "f1": 0.6951442132165023
+    },
+    "macro": {
+      "precision": 0.5417560285958174,
+      "recall": 0.5489115397306763,
+      "f1": 0.5453103116858907
+    }
+  }
+}
