@@ -43,6 +43,7 @@ CYCLING_P5_W      = 80.0
 
 MAX_TRAIN_SAMPLES = 20000
 RANDOM_SEED       = 42
+POS_WEIGHT_CLAMP  = (1.0, 10.0)   # clamp ON class weight to avoid precision collapse
 
 DEFAULT_DATASET_DIR = os.path.join(os.path.dirname(__file__), '..', 'APR-new-House1-dataset')
 
@@ -209,16 +210,26 @@ def main(dataset_dir: str = DEFAULT_DATASET_DIR, tune: bool = False,
         print(f"    Train ON%={100*y_state_tr_sub.mean():.1f}%  "
               f"Test ON%={100*y_state_te.mean():.1f}%")
 
-        # SVC (class_weight='balanced' handles imbalance automatically)
+        # Clamped class weight -- full imbalance ratio often causes precision collapse
+        # (e.g. dishwasher 50:1 -> SVC predicts ON everywhere). Clamp mirrors the
+        # POS_WEIGHT_CLAMP used in the PINN-LNN gate loss.
+        n_on      = max(int(y_state_tr_sub.sum()), 1)
+        n_off     = len(y_state_tr_sub) - n_on
+        raw_ratio = n_off / n_on
+        clamped   = float(np.clip(raw_ratio, *POS_WEIGHT_CLAMP))
+        cw        = {0: 1.0, 1: clamped}
+        print(f"    class_weight: raw={raw_ratio:.1f}  clamped={clamped:.1f}")
+
+        # SVC
         if tune:
             from sklearn.model_selection import GridSearchCV
-            clf = GridSearchCV(SVC(kernel='rbf', class_weight='balanced'),
+            clf = GridSearchCV(SVC(kernel='rbf', class_weight=cw),
                                {'C': [1, 10, 100], 'gamma': ['scale', 0.01, 0.1]},
                                cv=3, scoring='f1', n_jobs=-1)
             clf.fit(X_tr_sub, y_state_tr_sub)
             clf = clf.best_estimator_
         else:
-            clf = SVC(kernel='rbf', C=10, gamma='scale', class_weight='balanced')
+            clf = SVC(kernel='rbf', C=10, gamma='scale', class_weight=cw)
             clf.fit(X_tr_sub, y_state_tr_sub)
 
         # SVR -- StandardScaler on power target
