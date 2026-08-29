@@ -242,8 +242,10 @@ def main(dataset_dir: str = DEFAULT_DATASET_DIR,
             print(f"  {app:<18} {m['precision']:>6.3f} {m['recall']:>6.3f} {m['f1']:>6.3f} "
                   f"{m['mae']:>6.3f} {m['sae']:>6.3f} "
                   f"{m['tp']:>6d} {m['fp']:>6d} {m['fn']:>6d} {m['tn']:>6d}")
-        print(f"  {'micro-avg':<18} {mic['precision']:>6.3f} {mic['recall']:>6.3f} {mic['f1']:>6.3f}")
-        print(f"  {'macro-avg':<18} {mac['precision']:>6.3f} {mac['recall']:>6.3f} {mac['f1']:>6.3f}")
+        print(f"  {'micro-avg':<18} {mic['precision']:>6.3f} {mic['recall']:>6.3f} {mic['f1']:>6.3f} "
+              f"{mic['mae']:>6.3f} {mic['sae']:>6.3f}")
+        print(f"  {'macro-avg':<18} {mac['precision']:>6.3f} {mac['recall']:>6.3f} {mac['f1']:>6.3f} "
+              f"{mac['mae']:>6.3f} {mac['sae']:>6.3f}")
         return per_app, mic, mac
 
     val_per_app,  val_mic,  val_mac  = evaluate('val',  X_va, Y_va)

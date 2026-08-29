@@ -378,20 +378,64 @@ def mae_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return float(np.mean(np.abs(y_true - y_pred)))
 
 
-def sae_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+# Sub-window size for SAE, in prediction-windows (each already a
+# WIN_MINUTES-long FFT window from nilm_sfra_svm_house{1,2}.py, not a raw
+# 6s sample). The repo's canonical SAE (calculate_nilm_metrics in
+# Source Code/utils.py) uses N=100 raw 6s samples (~10 minutes); at this
+# SVM's granularity -- one row already covers a whole prediction window --
+# the equivalent real-time span is reached far sooner, so the default here
+# is deliberately much smaller. 10 prediction-windows x 6 min/window = 1
+# hour of wall-clock time per SAE sub-window.
+SAE_SUB_WINDOW = 10
+
+
+def _sae_components(y_true: np.ndarray, y_pred: np.ndarray, window: int = SAE_SUB_WINDOW):
     """
-    Window-level SAE: |sum(y_pred) - sum(y_true)| / N on the binary {0,1}
-    ON/OFF labels -- the normalized difference between the total number of
-    predicted-ON windows and actual-ON windows. A simple over/under-
-    detection bias measure, analogous in spirit to Signal Aggregate Error
-    but applied to window counts rather than Watts (same caveat as
-    mae_score above: this SVM has no power output to compute a Watt-scale
-    SAE from).
+    Shared implementation for sae_score and micro_average's pooled SAE.
+
+    Matches calculate_nilm_metrics' SAE formula exactly in structure: split
+    into sub-windows of `window` samples, sum the *local* |true - pred|
+    aggregate difference per sub-window, THEN normalize -- this is not the
+    same as a single global |sum(true) - sum(pred)| (that degenerate case
+    is only correct when window >= len(y_true), i.e. num_period <= 1, and
+    undercounts local mismatches that cancel out globally).
+
+    Returns (diff_sum, denom) so callers can either divide directly
+    (per-appliance) or sum diff_sum/denom across appliances first for an
+    exact micro-pooled value.
     """
     y_true = np.asarray(y_true).astype(float)
     y_pred = np.asarray(y_pred).astype(float)
     n = len(y_true)
-    return float(abs(np.sum(y_pred) - np.sum(y_true)) / n) if n > 0 else 0.0
+    num_period = int(n / window) if window > 0 else 0
+
+    if num_period == 0:
+        # Fewer samples than one sub-window -- fall back to a single
+        # whole-array window rather than dividing by zero.
+        diff_sum = abs(np.sum(y_true) - np.sum(y_pred))
+        denom = float(n)
+        return float(diff_sum), denom
+
+    diff_sum = 0.0
+    for i in range(num_period):
+        s, e = i * window, (i + 1) * window
+        diff_sum += abs(np.sum(y_true[s:e]) - np.sum(y_pred[s:e]))
+    denom = float(window * num_period)
+    return float(diff_sum), denom
+
+
+def sae_score(y_true: np.ndarray, y_pred: np.ndarray, window: int = SAE_SUB_WINDOW) -> float:
+    """
+    Window-level SAE on the binary {0,1} ON/OFF labels, using the same
+    sub-windowed-local-difference structure as calculate_nilm_metrics in
+    Source Code/utils.py (see SAE_SUB_WINDOW for why the sub-window size
+    differs). NOT power-in-Watts SAE like the neural-network scripts in
+    this repo -- this SVM only ever outputs a window-level ON/OFF
+    classification, never a continuous power estimate (same caveat as
+    mae_score above).
+    """
+    diff_sum, denom = _sae_components(y_true, y_pred, window)
+    return diff_sum / denom if denom > 0 else 0.0
 
 
 def per_appliance_metrics(Y_true: np.ndarray, Y_pred: np.ndarray, names: list[str]) -> dict:
@@ -401,35 +445,69 @@ def per_appliance_metrics(Y_true: np.ndarray, Y_pred: np.ndarray, names: list[st
         c = confusion_counts(Y_true[:, j], Y_pred[:, j])
         p = precision_score(c)
         r = recall_score(c)
+        sae_diff_sum, sae_denom = _sae_components(Y_true[:, j], Y_pred[:, j])
         results[name] = {
             "precision": p,
             "recall": r,
             "f1": f1_score(p, r),
             "mae": mae_score(Y_true[:, j], Y_pred[:, j]),
-            "sae": sae_score(Y_true[:, j], Y_pred[:, j]),
+            "sae": sae_diff_sum / sae_denom if sae_denom > 0 else 0.0,
             "tp": c.tp, "fp": c.fp, "fn": c.fn, "tn": c.tn,
+            # Internal, used by micro_average() for exact pooling -- not a
+            # metric to report on its own.
+            "_sae_diff_sum": sae_diff_sum, "_sae_denom": sae_denom,
         }
     return results
 
 
 def micro_average(per_app: dict) -> dict:
-    """Eqs. (11)-(13): sum TP/FP/FN across all labels first, then compute."""
+    """
+    Eqs. (11)-(13): sum TP/FP/FN across all labels first, then compute.
+
+    mae is pooled the same way: mae_score is linear in (FP, FN, total) on
+    binary labels -- mae = (FP + FN) / N -- so summing counts across
+    appliances first and applying that formula is the exact micro-pooled
+    value, not an approximation.
+
+    sae is NOT similarly reducible from TP/FP/FN alone once it's the
+    sub-windowed formula in _sae_components (order within each appliance's
+    sequence matters, not just the totals) -- so it's pooled by summing the
+    raw per-appliance (diff_sum, denom) components from per_appliance_metrics
+    before dividing, which is still exact, just needs those components
+    rather than TP/FP/FN.
+    """
     tp = sum(v["tp"] for v in per_app.values())
     fp = sum(v["fp"] for v in per_app.values())
     fn = sum(v["fn"] for v in per_app.values())
+    tn = sum(v["tn"] for v in per_app.values())
     p = tp / (tp + fp) if (tp + fp) > 0 else 0.0
     r = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     f1 = f1_score(p, r)
-    return {"precision": p, "recall": r, "f1": f1}
+    total = tp + fp + fn + tn
+    mae = (fp + fn) / total if total > 0 else 0.0
+    sae_diff_sum = sum(v["_sae_diff_sum"] for v in per_app.values())
+    sae_denom    = sum(v["_sae_denom"]    for v in per_app.values())
+    sae = sae_diff_sum / sae_denom if sae_denom > 0 else 0.0
+    return {"precision": p, "recall": r, "f1": f1, "mae": mae, "sae": sae}
 
 
 def macro_average(per_app: dict) -> dict:
-    """Eqs. (14)-(16): average the per-label precision/recall, then compute F1."""
+    """
+    Eqs. (14)-(16): average the per-label precision/recall, then compute F1.
+
+    mae/sae are averaged the same simple unweighted way (matches the
+    avgMAE/avgSAE convention already used across this repo's neural-network
+    scripts, e.g. np.mean([vm[a]['mae'] for a in APPLIANCES]) in
+    combined_pinn_lnn_apr_new_house1_dataset_v3.py) -- NOT derived from
+    pooled counts the way micro_average's are.
+    """
     n = len(per_app)
     p = sum(v["precision"] for v in per_app.values()) / n
     r = sum(v["recall"] for v in per_app.values()) / n
     f1 = f1_score(p, r)
-    return {"precision": p, "recall": r, "f1": f1}
+    mae = sum(v["mae"] for v in per_app.values()) / n
+    sae = sum(v["sae"] for v in per_app.values()) / n
+    return {"precision": p, "recall": r, "f1": f1, "mae": mae, "sae": sae}
 
 
 # ---------------------------------------------------------------------------
