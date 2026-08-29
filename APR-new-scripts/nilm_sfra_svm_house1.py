@@ -1,306 +1,183 @@
 """
-nilm_sfra_svm_house1.py
-========================
-Wires MultiLabelApplianceSVM (nilm_sfra_svm.py) to real APR-new-House1-dataset
-data instead of the synthetic demo.
+Basic SVM baseline for NILM: classification (on/off state) + regression (power draw).
 
-IMPORTANT -- this is NOT real SFRA data.
------------------------------------------
-The Mari et al. 2023 paper's SVM operates on genuine Swept-Frequency
-Response Analysis traces: a signal generator injects a frequency sweep
-(kHz range) onto the mains and measures the circuit's impedance response,
-which is a highly appliance-specific electrical fingerprint. UKDALE (and
-this repo's UKDALE_HF_*.csv files) contains none of that -- only 6-second
-active-power samples.
+Two independent SVM heads per appliance, mirroring the classification+regression
+framing used in your gated dual-head ATGLNets architecture:
+  - SVC  (RBF kernel) -> appliance ON/OFF state
+  - SVR  (RBF kernel) -> appliance power (Watts)
 
-What this script does instead is build a *proxy* frequency-domain feature
-vector by taking the FFT magnitude spectrum of short windows of the
-aggregate active-power signal. This gives the SVM the same *shape* of
-input the paper expects (one feature per frequency bin) but the frequency
-axis here is minutes-scale power fluctuation, not kHz-scale circuit
-impedance. Treat results as a structural proof-of-concept for the
-SVM/metrics pipeline, not as a reproduction of the paper's accuracy.
+Usage:
+    python svm_nilm_baseline.py
 
-Pipeline:
-  1. Load House 1 train/val/test splits (same CSVs as the PINN-LNN scripts).
-  2. Slide a WIN_MINUTES-long window over the aggregate power signal
-     (TRAIN_STRIDE_MINUTES on train for overlap augmentation, non-overlapping
-     on val/test).
-  3. Feature = log1p(|rFFT(window - window.mean())|)  -- one value per
-     frequency bin, DC-removed so the spectrum reflects fluctuation shape
-     rather than absolute power level.
-  4. Label per appliance per window = ON if the appliance's ON-fraction
-     within the window exceeds ON_FRACTION_THRESHOLD (adaptive per-appliance
-     power threshold from compute_adaptive_thresholds, computed on train
-     only and reused for val/test -- same threshold-locking lesson as
-     combined_pinn_lnn_apr_new_house1_dataset_v3.py's FIX 1).
-  5. Train one binary SVM per appliance (MultiLabelApplianceSVM) on train,
-     evaluate on val and test with the paper's Eq. (8)-(16) metrics
-     (per-appliance + micro/macro averaged).
-
-Backend / data-volume note
----------------------------
-Default backend is "approx" (Nystroem kernel approximation + linear
-SGDClassifier, see nilm_sfra_svm.py) trained on the FULL train-window set
-(no subsampling) -- this makes it a fair apples-to-apples comparison
-against the PINN-LNN, which also trains on all the data, rather than
-against a small SVC subsample. Pass --backend svc to use the exact
-polynomial-kernel SVC instead; that backend still needs --max-train-windows
-capped (default 2000) since its training cost scales far worse than cubic
-in n on the weakly-separable classes here (see the House 1 run log:
-800->0.9s, 3000->205s, dominated by 'fridge').
+Swap `load_data()` for your real UK-DALE windowed feature extraction
+(e.g. the same features used for your SFRA-SVM baseline) to get a real
+comparison table in the same format as your ablation logs.
 """
 
-import os
-import sys
-import json
-import time
 import numpy as np
-import pandas as pd
-
-sys.path.insert(0, os.path.dirname(__file__))
-from nilm_sfra_svm import MultiLabelApplianceSVM, per_appliance_metrics, micro_average, macro_average
-
-# Reuse the (train-locked) adaptive threshold logic from v3 instead of
-# duplicating it -- same folder, same threshold-consistency lesson (FIX 1).
-from combined_pinn_lnn_apr_new_house1_dataset_v3 import compute_adaptive_thresholds, APPLIANCES, AGG_COL
-
-
-DEFAULT_DATASET_DIR = os.path.join(os.path.dirname(__file__), '..', 'APR-new-House1-dataset')
-
-STEP_SECONDS          = 6.0
-WIN_MINUTES            = 6.0    # proxy-SFRA analysis window length
-TRAIN_STRIDE_MINUTES   = 3.0    # 50% overlap on train (augmentation)
-ON_FRACTION_THRESHOLD  = 0.05   # window labeled ON if appliance exceeds its
-                                 # power threshold for >=5% of the window
-
-DEFAULT_BACKEND        = "approx"  # "approx" trains on the full window set (no cap
-                                    # needed below); "svc"/"scratch" do not scale and
-                                    # need MAX_TRAIN_WINDOWS_SVC_DEFAULT.
-N_COMPONENTS           = 300    # Nystroem feature-map dimensionality (approx backend only)
-ALPHA                  = 1e-4   # SGDClassifier L2 regularization (approx backend only)
-
-MAX_TRAIN_WINDOWS_SVC_DEFAULT = 2000   # fallback subsample cap, backend="svc"/"scratch" only.
-                                 # NOTE: exact SVC fit time on these proxy features scales
-                                 # far worse than cubic in n (measured: 800->0.9s, 3000->205s),
-                                 # driven almost entirely by 'fridge' (~60% ON, weakly
-                                 # separable by this feature set -> many bounded support
-                                 # vectors -> slow SMO convergence). Raise this only with
-                                 # that in mind -- or just use backend="approx" instead.
-RANDOM_SEED            = 0
+from sklearn.svm import SVC, SVR
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.metrics import (
+    f1_score, precision_score, recall_score,
+    confusion_matrix,
+)
 
 
-# ---------------------------------------------------------------------------
-# Data loading (same file layout as the PINN-LNN House 1 scripts)
-# ---------------------------------------------------------------------------
-
-def load_data(dataset_dir: str) -> dict:
-    print(f"Loading APR-new-House1-dataset CSV data from '{dataset_dir}' ...")
-    file_map = {'train': 'UKDALE_HF_train.csv',
-                'val':   'UKDALE_HF_validation.csv',
-                'test':  'UKDALE_HF_test.csv'}
-    splits = {}
-    for name, fname in file_map.items():
-        path = os.path.join(dataset_dir, fname)
-        splits[name] = pd.read_csv(path, index_col='timestamp', parse_dates=True)
-        df = splits[name]
-        print(f"  {name:6s}: {len(df):>7,} rows  "
-              f"{df.index.min().date()} -> {df.index.max().date()}")
-    return splits
-
-
-# ---------------------------------------------------------------------------
-# Proxy-SFRA feature extraction + windowed labeling
-# ---------------------------------------------------------------------------
-
-def fft_feature(window_power: np.ndarray) -> np.ndarray:
-    """log1p(|rFFT(window - mean)|) -- one feature per frequency bin, DC removed."""
-    centered = window_power - window_power.mean()
-    spec = np.abs(np.fft.rfft(centered))
-    return np.log1p(spec).astype(np.float32)
-
-
-def build_windows(df: pd.DataFrame, thresholds: dict, win_steps: int, stride_steps: int):
+# ----------------------------------------------------------------------
+# 1. Data loading (placeholder — replace with real UK-DALE feature windows)
+# ----------------------------------------------------------------------
+def load_data(appliance: str, n_samples: int = 5000, n_features: int = 16, seed: int = 0):
     """
-    Slide a win_steps-long window over df[AGG_COL] with the given stride.
+    Placeholder synthetic data generator.
 
-    Returns:
-        X : (n_windows, win_steps//2 + 1) FFT magnitude features
-        Y : (n_windows, n_appliances) binary ON/OFF labels
+    Replace this with your real feature extraction: e.g. windowed
+    aggregate power statistics (mean, std, delta, spectral features
+    a la SFRA) with per-timestep appliance state (0/1) and power (W)
+    as targets, same as used for the SFRA-SVM baseline.
+
+    Returns
+    -------
+    X : (n_samples, n_features) feature matrix
+    y_state : (n_samples,) binary on/off labels
+    y_power : (n_samples,) continuous power draw (W)
     """
-    agg  = df[AGG_COL].values.astype(np.float32)
-    apps = {app: df[app].values.astype(np.float32) for app in APPLIANCES}
-    n = len(agg)
+    rng = np.random.default_rng(seed)
+    X = rng.normal(size=(n_samples, n_features))
 
-    X, Y = [], []
-    for start in range(0, n - win_steps + 1, stride_steps):
-        end = start + win_steps
-        X.append(fft_feature(agg[start:end]))
-        row = []
-        for app in APPLIANCES:
-            on_frac = float(np.mean(apps[app][start:end] > thresholds[app]))
-            row.append(1 if on_frac >= ON_FRACTION_THRESHOLD else 0)
-        Y.append(row)
+    # Fake a state boundary as a nonlinear combination of features
+    logits = X[:, 0] * 1.5 - X[:, 1] ** 2 + 0.5 * X[:, 2] * X[:, 3]
+    y_state = (logits > np.median(logits)).astype(int)
 
-    return np.array(X, dtype=np.float32), np.array(Y, dtype=np.int64)
+    # Power correlates with state + a couple of noisy features
+    base_power = {"dishwasher": 1200, "fridge": 90, "microwave": 1100, "washing_machine": 1800}
+    p0 = base_power.get(appliance, 500)
+    y_power = y_state * (p0 + 50 * X[:, 4]) + rng.normal(0, 10, size=n_samples)
+    y_power = np.clip(y_power, 0, None)
+
+    return X, y_state, y_power
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# 2. SVM classification (state: ON/OFF)
+# ----------------------------------------------------------------------
+def train_svm_classifier(X_train, y_train, tune=False):
+    scaler = StandardScaler().fit(X_train)
+    X_train_s = scaler.transform(X_train)
 
-def main(dataset_dir: str = DEFAULT_DATASET_DIR,
-        degree: int = 3, coef0: float = 1.0, C: float = 1.0,
-        backend: str = DEFAULT_BACKEND,
-        n_components: int = N_COMPONENTS, alpha: float = ALPHA,
-        class_weight: str | None = None,
-        max_train_windows: int | None = None):
-
-    rng = np.random.default_rng(RANDOM_SEED)
-
-    data = load_data(dataset_dir)
-    df_tr, df_va, df_te = data['train'], data['val'], data['test']
-
-    win_steps    = int(round(WIN_MINUTES * 60.0 / STEP_SECONDS))
-    tr_stride    = int(round(TRAIN_STRIDE_MINUTES * 60.0 / STEP_SECONDS))
-    eval_stride  = win_steps  # non-overlapping on val/test
-
-    # Thresholds computed on train only, reused for val/test (avoids the
-    # moving-goalpost problem FIX 1 addressed in the PINN-LNN v2/v3 scripts)
-    thresholds = compute_adaptive_thresholds(df_tr)
-    print(f"\nAdaptive thresholds (train-locked): "
-          + ", ".join(f"{app}={thresholds[app]:.1f}W" for app in APPLIANCES))
-    print(f"Window: {WIN_MINUTES:.1f} min ({win_steps} steps)  "
-          f"train_stride={TRAIN_STRIDE_MINUTES:.1f} min  on_fraction>={ON_FRACTION_THRESHOLD:.0%}\n")
-
-    print("Building windows ...")
-    X_tr, Y_tr = build_windows(df_tr, thresholds, win_steps, tr_stride)
-    X_va, Y_va = build_windows(df_va, thresholds, win_steps, eval_stride)
-    X_te, Y_te = build_windows(df_te, thresholds, win_steps, eval_stride)
-    print(f"  Train windows: {X_tr.shape}  Val windows: {X_va.shape}  Test windows: {X_te.shape}")
-
-    for split_name, Y in [('train', Y_tr), ('val', Y_va), ('test', Y_te)]:
-        print(f"  {split_name:5s} ON-fraction per appliance: " +
-              ", ".join(f"{app}={100*Y[:, i].mean():.1f}%" for i, app in enumerate(APPLIANCES)))
-
-    # Only the exact "svc"/"scratch" backends need subsampling (training cost
-    # scales far worse than cubic in n on these weakly-separable classes).
-    # "approx" trains on the full window set by default.
-    if max_train_windows is None and backend != "approx":
-        max_train_windows = MAX_TRAIN_WINDOWS_SVC_DEFAULT
-
-    if max_train_windows is not None and X_tr.shape[0] > max_train_windows:
-        idx = rng.choice(X_tr.shape[0], size=max_train_windows, replace=False)
-        X_tr, Y_tr = X_tr[idx], Y_tr[idx]
-        print(f"\n  Subsampled train windows to {max_train_windows:,} "
-              f"(random, seed={RANDOM_SEED}) for {backend} training tractability.")
-        print(f"  Subsampled ON-fraction: " +
-              ", ".join(f"{app}={100*Y_tr[:, i].mean():.1f}%" for i, app in enumerate(APPLIANCES)))
+    if tune:
+        # Small grid search, mirrors the GridSearchCV(C, gamma) approach
+        # seen in the low-frequency SVM NILM papers.
+        param_grid = {"C": [1, 10, 100], "gamma": ["scale", 0.01, 0.1]}
+        clf = GridSearchCV(SVC(kernel="rbf", class_weight="balanced"),
+                            param_grid, cv=3, scoring="f1", n_jobs=-1)
+        clf.fit(X_train_s, y_train)
+        clf = clf.best_estimator_
     else:
-        print(f"\n  Training on the full {X_tr.shape[0]:,} windows (no subsampling, backend={backend}).")
+        clf = SVC(kernel="rbf", C=10, gamma="scale", class_weight="balanced")
+        clf.fit(X_train_s, y_train)
 
-    # Feature standardization (zero mean / unit variance per frequency bin) --
-    # fit on train only, applied to val/test.
-    feat_mean = X_tr.mean(axis=0, keepdims=True)
-    feat_std  = X_tr.std(axis=0, keepdims=True) + 1e-8
-    X_tr = (X_tr - feat_mean) / feat_std
-    X_va = (X_va - feat_mean) / feat_std
-    X_te = (X_te - feat_mean) / feat_std
+    return clf, scaler
 
-    if backend == "approx":
-        print(f"\nTraining MultiLabelApplianceSVM "
-              f"(backend=approx: Nystroem poly degree={degree} coef0={coef0} "
-              f"n_components={n_components} + SGDClassifier alpha={alpha} "
-              f"class_weight={class_weight}) ...")
+
+# ----------------------------------------------------------------------
+# 3. SVM regression (power draw, Watts)
+# ----------------------------------------------------------------------
+def train_svm_regressor(X_train, y_train, tune=False):
+    scaler_X = StandardScaler().fit(X_train)
+    scaler_y = StandardScaler().fit(y_train.reshape(-1, 1))
+
+    X_train_s = scaler_X.transform(X_train)
+    y_train_s = scaler_y.transform(y_train.reshape(-1, 1)).ravel()
+
+    if tune:
+        param_grid = {"C": [1, 10, 100], "gamma": ["scale", 0.01, 0.1], "epsilon": [0.01, 0.1]}
+        reg = GridSearchCV(SVR(kernel="rbf"), param_grid, cv=3,
+                            scoring="neg_mean_absolute_error", n_jobs=-1)
+        reg.fit(X_train_s, y_train_s)
+        reg = reg.best_estimator_
     else:
-        print(f"\nTraining MultiLabelApplianceSVM "
-              f"(backend={backend}, poly degree={degree}, coef0={coef0}, C={C}) ...")
-    system = MultiLabelApplianceSVM(APPLIANCES, degree=degree, coef0=coef0, C=C,
-                                    backend=backend, n_components=n_components,
-                                    alpha=alpha, class_weight=class_weight,
-                                    random_state=RANDOM_SEED)
-    t0 = time.time()
-    for j, app in enumerate(APPLIANCES):
-        t_app = time.time()
-        model = system._make_model()
-        model.fit(X_tr, Y_tr[:, j])
-        system.models[app] = model
-        print(f"    {app:<18} fit time: {time.time() - t_app:6.1f}s")
-    print(f"  Total fit time: {time.time() - t0:.1f}s")
+        reg = SVR(kernel="rbf", C=10, gamma="scale", epsilon=0.05)
+        reg.fit(X_train_s, y_train_s)
 
-    def evaluate(split_name, X, Y):
-        Y_pred = system.predict(X)
-        per_app = per_appliance_metrics(Y, Y_pred, APPLIANCES)
-        mic = micro_average(per_app)
-        mac = macro_average(per_app)
-        print(f"\n{split_name.upper()}  ({X.shape[0]:,} windows)"
-              f"  [MAE/SAE are window-level on binary ON/OFF labels, not Watts -- see "
-              f"mae_score/sae_score docstrings in nilm_sfra_svm.py]")
-        print(f"  {'Appliance':<18} {'P':>6} {'R':>6} {'F1':>6} {'MAE':>6} {'SAE':>6} "
-              f"{'TP':>6} {'FP':>6} {'FN':>6} {'TN':>6}")
-        for app, m in per_app.items():
-            print(f"  {app:<18} {m['precision']:>6.3f} {m['recall']:>6.3f} {m['f1']:>6.3f} "
-                  f"{m['mae']:>6.3f} {m['sae']:>6.3f} "
-                  f"{m['tp']:>6d} {m['fp']:>6d} {m['fn']:>6d} {m['tn']:>6d}")
-        print(f"  {'micro-avg':<18} {mic['precision']:>6.3f} {mic['recall']:>6.3f} {mic['f1']:>6.3f} "
-              f"{mic['mae']:>6.3f} {mic['sae']:>6.3f}")
-        print(f"  {'macro-avg':<18} {mac['precision']:>6.3f} {mac['recall']:>6.3f} {mac['f1']:>6.3f} "
-              f"{mac['mae']:>6.3f} {mac['sae']:>6.3f}")
-        return per_app, mic, mac
+    return reg, scaler_X, scaler_y
 
-    val_per_app,  val_mic,  val_mac  = evaluate('val',  X_va, Y_va)
-    test_per_app, test_mic, test_mac = evaluate('test', X_te, Y_te)
 
-    results = {
-        'note': 'Proxy-SFRA (FFT of aggregate power windows), NOT real SFRA -- see module docstring.',
-        'window': {'win_minutes': WIN_MINUTES, 'train_stride_minutes': TRAIN_STRIDE_MINUTES,
-                   'on_fraction_threshold': ON_FRACTION_THRESHOLD},
-        'thresholds_w': thresholds,
-        'svm_params': {'backend': backend, 'degree': degree, 'coef0': coef0, 'C': C,
-                       'kernel': 'poly', 'n_components': n_components, 'alpha': alpha,
-                       'class_weight': class_weight},
-        'max_train_windows': max_train_windows,
-        'train_windows_used': int(X_tr.shape[0]),
-        'val':  {'per_appliance': val_per_app,  'micro': val_mic,  'macro': val_mac},
-        'test': {'per_appliance': test_per_app, 'micro': test_mic, 'macro': test_mac},
+# ----------------------------------------------------------------------
+# 4. Evaluation, formatted like your ablation result tables
+# ----------------------------------------------------------------------
+def evaluate_appliance(appliance, X_test, y_state_test, y_power_test,
+                        clf, clf_scaler, reg, reg_scaler_X, reg_scaler_y):
+    # --- classification metrics ---
+    X_test_s = clf_scaler.transform(X_test)
+    y_state_pred = clf.predict(X_test_s)
+
+    f1 = f1_score(y_state_test, y_state_pred, zero_division=0)
+    prec = precision_score(y_state_test, y_state_pred, zero_division=0)
+    rec = recall_score(y_state_test, y_state_pred, zero_division=0)
+    tn, fp, fn, tp = confusion_matrix(y_state_test, y_state_pred, labels=[0, 1]).ravel()
+
+    # --- regression metrics (only evaluated on true ON windows, common NILM convention) ---
+    X_test_rs = reg_scaler_X.transform(X_test)
+    y_power_pred_s = reg.predict(X_test_rs)
+    y_power_pred = reg_scaler_y.inverse_transform(y_power_pred_s.reshape(-1, 1)).ravel()
+    y_power_pred = np.clip(y_power_pred, 0, None)
+
+    mae = np.mean(np.abs(y_power_test - y_power_pred))
+
+    N = 100
+    num_period = int(len(y_power_test) / N)
+    diff = 0
+    for i in range(num_period):
+        diff += abs(np.sum(y_power_test[i*N:(i+1)*N]) - np.sum(y_power_pred[i*N:(i+1)*N]))
+    sae = diff / (N * num_period) if num_period > 0 else 0.0
+
+    return {
+        "appliance": appliance, "f1": f1, "prec": prec, "rec": rec,
+        "mae": mae, "sae": sae, "tp": tp, "tn": tn, "fp": fp, "fn": fn,
     }
-    out_path = os.path.join(os.path.dirname(__file__), '..', 'APR-new-House1-dataset',
-                            'sfra_svm_house1_results.json')
-    with open(out_path, 'w', encoding='utf-8') as f:
-        json.dump(results, f, indent=2)
-    print(f"\nResults saved -> {out_path}")
 
+
+def print_results_table(results):
+    header = f"{'Appliance':<18}{'F1':>8}{'Prec':>8}{'Rec':>8}{'MAE':>8}{'SAE':>8}{'TP':>10}{'TN':>10}{'FP':>10}{'FN':>10}"
+    print(header)
+    print("-" * len(header))
+    for r in results:
+        print(f"{r['appliance']:<18}{r['f1']:>8.4f}{r['prec']:>8.4f}{r['rec']:>8.4f}"
+              f"{r['mae']:>8.2f}{r['sae']:>8.4f}{r['tp']:>10,}{r['tn']:>10,}{r['fp']:>10,}{r['fn']:>10,}")
+
+    n = len(results)
+    print("-" * len(header))
+    print(f"{'MACRO AVG':<18}"
+          f"{np.mean([r['f1'] for r in results]):>8.4f}"
+          f"{np.mean([r['prec'] for r in results]):>8.4f}"
+          f"{np.mean([r['rec'] for r in results]):>8.4f}"
+          f"{np.mean([r['mae'] for r in results]):>8.2f}"
+          f"{np.mean([r['sae'] for r in results]):>8.4f}")
+
+
+# ----------------------------------------------------------------------
+# 5. Main
+# ----------------------------------------------------------------------
+def main(appliances=("dishwasher", "fridge", "microwave", "washing_machine"), tune=False):
+    results = []
+    for appliance in appliances:
+        X, y_state, y_power = load_data(appliance)
+        X_train, X_test, ys_train, ys_test, yp_train, yp_test = train_test_split(
+            X, y_state, y_power, test_size=0.3, random_state=42, stratify=y_state
+        )
+
+        clf, clf_scaler = train_svm_classifier(X_train, ys_train, tune=tune)
+        reg, reg_scaler_X, reg_scaler_y = train_svm_regressor(X_train, yp_train, tune=tune)
+
+        results.append(evaluate_appliance(
+            appliance, X_test, ys_test, yp_test,
+            clf, clf_scaler, reg, reg_scaler_X, reg_scaler_y,
+        ))
+
+    print_results_table(results)
     return results
 
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--dataset-dir', default=DEFAULT_DATASET_DIR)
-    parser.add_argument('--backend', choices=['approx', 'svc', 'scratch'], default=DEFAULT_BACKEND,
-                        help='approx trains on the full dataset (default); svc/scratch use the '
-                             'exact polynomial kernel and need --max-train-windows capped.')
-    parser.add_argument('--degree', type=int, default=3)
-    parser.add_argument('--coef0',  type=float, default=1.0)
-    parser.add_argument('--C',      type=float, default=1.0)
-    parser.add_argument('--n-components', type=int, default=N_COMPONENTS,
-                        help='Nystroem feature-map dimensionality (approx backend only).')
-    parser.add_argument('--alpha', type=float, default=ALPHA,
-                        help='SGDClassifier L2 regularization (approx backend only).')
-    parser.add_argument('--class-weight', choices=['none', 'balanced'], default='none',
-                        help="approx backend only. 'none' (default) matches sklearn's own "
-                             "default but can fully collapse to predicting OFF on a severely "
-                             "imbalanced appliance (measured: House 2 microwave -> F1=0.000). "
-                             "'balanced' fixes that collapse but craters precision on the rare "
-                             "classes instead (measured: 0.03-0.21 precision) -- net macro-F1 "
-                             "was slightly worse on both houses in testing, not a free win. "
-                             "See MultiLabelApplianceSVM's class_weight docstring for details.")
-    parser.add_argument('--max-train-windows', type=int, default=None,
-                        help=f'Cap on train windows (random subsample). Default: no cap for '
-                             f'backend=approx; {MAX_TRAIN_WINDOWS_SVC_DEFAULT} for backend=svc/scratch.')
-    args = parser.parse_args()
-
-    main(dataset_dir=args.dataset_dir, degree=args.degree, coef0=args.coef0, C=args.C,
-        backend=args.backend, n_components=args.n_components, alpha=args.alpha,
-        class_weight=None if args.class_weight == 'none' else args.class_weight,
-        max_train_windows=args.max_train_windows)
+    main(tune=False)  # set tune=True to grid-search C/gamma/epsilon (slower)
