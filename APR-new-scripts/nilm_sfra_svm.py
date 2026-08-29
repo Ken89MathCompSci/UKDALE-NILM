@@ -363,8 +363,39 @@ def f1_score(precision: float, recall: float) -> float:
     return 2 * precision * recall / denom if denom > 0 else 0.0
 
 
+def mae_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """
+    Window-level MAE: mean(|y_true - y_pred|) on the binary {0,1} ON/OFF
+    labels. NOT power-in-Watts MAE like the neural-network scripts in this
+    repo (calculate_nilm_metrics in Source Code/utils.py) -- this SVM only
+    ever outputs a window-level ON/OFF classification, never a continuous
+    power estimate, so there's no Watt-scale quantity to compare. On binary
+    labels this reduces exactly to the misclassified-window rate,
+    (FP + FN) / N.
+    """
+    y_true = np.asarray(y_true).astype(float)
+    y_pred = np.asarray(y_pred).astype(float)
+    return float(np.mean(np.abs(y_true - y_pred)))
+
+
+def sae_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """
+    Window-level SAE: |sum(y_pred) - sum(y_true)| / N on the binary {0,1}
+    ON/OFF labels -- the normalized difference between the total number of
+    predicted-ON windows and actual-ON windows. A simple over/under-
+    detection bias measure, analogous in spirit to Signal Aggregate Error
+    but applied to window counts rather than Watts (same caveat as
+    mae_score above: this SVM has no power output to compute a Watt-scale
+    SAE from).
+    """
+    y_true = np.asarray(y_true).astype(float)
+    y_pred = np.asarray(y_pred).astype(float)
+    n = len(y_true)
+    return float(abs(np.sum(y_pred) - np.sum(y_true)) / n) if n > 0 else 0.0
+
+
 def per_appliance_metrics(Y_true: np.ndarray, Y_pred: np.ndarray, names: list[str]) -> dict:
-    """Returns {appliance: {precision, recall, f1, tp, fp, fn, tn}}"""
+    """Returns {appliance: {precision, recall, f1, mae, sae, tp, fp, fn, tn}}"""
     results = {}
     for j, name in enumerate(names):
         c = confusion_counts(Y_true[:, j], Y_pred[:, j])
@@ -374,6 +405,8 @@ def per_appliance_metrics(Y_true: np.ndarray, Y_pred: np.ndarray, names: list[st
             "precision": p,
             "recall": r,
             "f1": f1_score(p, r),
+            "mae": mae_score(Y_true[:, j], Y_pred[:, j]),
+            "sae": sae_score(Y_true[:, j], Y_pred[:, j]),
             "tp": c.tp, "fp": c.fp, "fn": c.fn, "tn": c.tn,
         }
     return results

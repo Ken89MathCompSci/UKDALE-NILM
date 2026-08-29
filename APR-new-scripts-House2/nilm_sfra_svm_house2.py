@@ -244,10 +244,14 @@ def main(dataset_dir: str = DEFAULT_DATASET_DIR,
         per_app = per_appliance_metrics(Y, Y_pred, APPLIANCES)
         mic = micro_average(per_app)
         mac = macro_average(per_app)
-        print(f"\n{split_name.upper()}  ({X.shape[0]:,} windows)")
-        print(f"  {'Appliance':<18} {'P':>6} {'R':>6} {'F1':>6} {'TP':>6} {'FP':>6} {'FN':>6} {'TN':>6}")
+        print(f"\n{split_name.upper()}  ({X.shape[0]:,} windows)"
+              f"  [MAE/SAE are window-level on binary ON/OFF labels, not Watts -- see "
+              f"mae_score/sae_score docstrings in nilm_sfra_svm.py]")
+        print(f"  {'Appliance':<18} {'P':>6} {'R':>6} {'F1':>6} {'MAE':>6} {'SAE':>6} "
+              f"{'TP':>6} {'FP':>6} {'FN':>6} {'TN':>6}")
         for app, m in per_app.items():
             print(f"  {app:<18} {m['precision']:>6.3f} {m['recall']:>6.3f} {m['f1']:>6.3f} "
+                  f"{m['mae']:>6.3f} {m['sae']:>6.3f} "
                   f"{m['tp']:>6d} {m['fp']:>6d} {m['fn']:>6d} {m['tn']:>6d}")
         print(f"  {'micro-avg':<18} {mic['precision']:>6.3f} {mic['recall']:>6.3f} {mic['f1']:>6.3f}")
         print(f"  {'macro-avg':<18} {mac['precision']:>6.3f} {mac['recall']:>6.3f} {mac['f1']:>6.3f}")
