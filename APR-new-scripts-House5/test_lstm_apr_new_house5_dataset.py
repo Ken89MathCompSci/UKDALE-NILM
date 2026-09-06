@@ -4,7 +4,7 @@ LSTM baseline for NILM -- APR-new-House5-dataset/ splits.
 Derived from Old-LNN_Algorithms/test_lstm_ukdale_specific_splits.py with the
 same three changes described in test_gru_apr_new_house5_dataset.py:
   1. Reads APR-new-House5-dataset/ CSVs instead of pickled UKDALE splits
-     (House 5, train 2014-07-25..08-23 / val 08-24..08-30 / test 08-31..09-06).
+     (House 5, train 2014-08-04..09-02 / val 09-03..09-09 / test 09-10..09-16).
   2. Fixed the X/y midpoint-alignment bug from the old script.
   3. Per-appliance thresholds (not the uniform 10 W used for House 1) --
      building5.yaml's own on_power_threshold values, matching
@@ -385,9 +385,9 @@ def test_lstm_on_all_appliances(window_size=100, hidden_size=128, num_layers=2,
         'dataset': 'APR-new-House5-dataset',
         'model': 'LSTMModel',
         'dataset_splits': {
-            'training':   {'house': 5, 'start': '2014-07-25', 'end': '2014-08-23'},
-            'validation': {'house': 5, 'start': '2014-08-24', 'end': '2014-08-30'},
-            'testing':    {'house': 5, 'start': '2014-08-31', 'end': '2014-09-06'}
+            'training':   {'house': 5, 'start': '2014-08-04', 'end': '2014-09-02'},
+            'validation': {'house': 5, 'start': '2014-09-03', 'end': '2014-09-09'},
+            'testing':    {'house': 5, 'start': '2014-09-10', 'end': '2014-09-16'}
         },
         'window_size': window_size,
         'model_params': {'hidden_size': hidden_size, 'num_layers': num_layers,

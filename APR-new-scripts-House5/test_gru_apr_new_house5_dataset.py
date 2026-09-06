@@ -5,9 +5,9 @@ Derived from Old-LNN_Algorithms/test_gru_ukdale_specific_splits.py with three ch
 
 1. DATA SOURCE -- reads directly from APR-new-House5-dataset/ CSV files instead
    of the pickled data/ukdale/*_small.pkl splits:
-       APR-new-House5-dataset/UKDALE_HF_train.csv      (House 5, 2014-07-25 to 2014-08-23, 30 days)
-       APR-new-House5-dataset/UKDALE_HF_validation.csv (House 5, 2014-08-24 to 2014-08-30, 7 days)
-       APR-new-House5-dataset/UKDALE_HF_test.csv       (House 5, 2014-08-31 to 2014-09-06, 7 days)
+       APR-new-House5-dataset/UKDALE_HF_train.csv      (House 5, 2014-08-04 to 2014-09-02, 30 days)
+       APR-new-House5-dataset/UKDALE_HF_validation.csv (House 5, 2014-09-03 to 2014-09-09, 7 days)
+       APR-new-House5-dataset/UKDALE_HF_test.csv       (House 5, 2014-09-10 to 2014-09-16, 7 days)
    Appliances: dishwasher, fridge, microwave, washing_machine (all House 5 --
    no cross-house domain shift, but House 5 DOES have standby-power artefacts
    on two channels, see point 3).
@@ -404,9 +404,9 @@ def test_gru_on_all_appliances(window_size=100, hidden_size=128, num_layers=2,
         'dataset': 'APR-new-House5-dataset',
         'model': 'GRUModel',
         'dataset_splits': {
-            'training':   {'house': 5, 'start': '2014-07-25', 'end': '2014-08-23'},
-            'validation': {'house': 5, 'start': '2014-08-24', 'end': '2014-08-30'},
-            'testing':    {'house': 5, 'start': '2014-08-31', 'end': '2014-09-06'}
+            'training':   {'house': 5, 'start': '2014-08-04', 'end': '2014-09-02'},
+            'validation': {'house': 5, 'start': '2014-09-03', 'end': '2014-09-09'},
+            'testing':    {'house': 5, 'start': '2014-09-10', 'end': '2014-09-16'}
         },
         'window_size': window_size,
         'model_params': {

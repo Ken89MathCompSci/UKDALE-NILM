@@ -526,9 +526,9 @@ def test_tcn_on_all_appliances(window_size=100, num_channels=None, kernel_size=3
         'model': 'GatedTCNModel',
         'version': 'v2',
         'dataset_splits': {
-            'training':   {'house': 5, 'start': '2014-07-25', 'end': '2014-08-23'},
-            'validation': {'house': 5, 'start': '2014-08-24', 'end': '2014-08-30'},
-            'testing':    {'house': 5, 'start': '2014-08-31', 'end': '2014-09-06'}
+            'training':   {'house': 5, 'start': '2014-08-04', 'end': '2014-09-02'},
+            'validation': {'house': 5, 'start': '2014-09-03', 'end': '2014-09-09'},
+            'testing':    {'house': 5, 'start': '2014-09-10', 'end': '2014-09-16'}
         },
         'window_size': window_size,
         'thresholds_w': thresholds,

@@ -12,9 +12,9 @@ per appliance:
       evening; fridge is roughly uniform across all 24 hours).
 
 Splits (all House 5, chronologically contiguous, no gap/overlap):
-    train      2014-07-25 to 2014-08-23 (30 days)
-    validation 2014-08-24 to 2014-08-30 (7 days)
-    test       2014-08-31 to 2014-09-06 (7 days)
+    train      2014-08-04 to 2014-09-02 (30 days)
+    validation 2014-09-03 to 2014-09-09 (7 days)
+    test       2014-09-10 to 2014-09-16 (7 days)
 
 House 5 sensor artefacts that affect thresholds (see DATASETS.md and
 generate_apr_new_house5_dataset.py):
