@@ -31,23 +31,24 @@ These thresholds are for informational activation-rate printing only; the
 saved CSVs contain raw power values so downstream scripts can apply
 whichever threshold they need.
 
-A 44-day contiguous window (30 train + 7 val + 7 test) was selected by
-scanning daily appliance activation counts (at the thresholds above) across
-every gap-free 44-day stretch in the 2014-06-30 to 2014-09-06 block (the
-longest gap-free run, ending just before the 2014-09-07 partial-day gap),
-maximising the minimum activation count across dishwasher, microwave, and
-washing_machine (fridge cycles continuously regardless of day so it wasn't a
-selection factor). House 5's real microwave usage is legitimately sparse
-(short, infrequent zaps -- a few minutes/day at most) throughout the entire
-recording, so no window fully escapes this; the chosen window is the best
-available:
+A 44-day window (30 train + 7 val + 7 test) was selected by scanning every
+30-day window across the full 2014-06-30 to 2014-11-13 range, maximising
+microwave event count in the training split.
 
-    train      : 2014-07-25 to 2014-08-23  (30 days)
-                 DW=8009 hits, MW=225 hits, WM=12087 hits
-    validation : 2014-08-24 to 2014-08-30  (7 days)
-                 DW=3619 hits, MW=147 hits, WM=2802 hits
-    test       : 2014-08-31 to 2014-09-06  (7 days)
-                 DW=2763 hits, MW=171 hits, WM=2601 hits
+v1 selection (2014-07-25 to 2014-09-06) was the best fully gap-free 44-day
+stretch but yielded only 16 MW events in training.
+
+v2 selection (2014-08-04 to 2014-09-16) shifts training 10 days later to
+capture the peak microwave-usage period, nearly doubling MW training events
+to ~31. The validation split (2014-09-03 to 2014-09-09) spans the known
+2014-09-07 partial-day gap (8422 samples vs ~13400 normal), which is handled
+by the existing forward-fill policy (MAX_FILL=50 steps, ~5 min). One partial
+day of patched data in validation is an acceptable trade-off for the
+substantial improvement in training microwave coverage.
+
+    train      : 2014-08-04 to 2014-09-02  (30 days, ~31 MW events)
+    validation : 2014-09-03 to 2014-09-09  (7 days,  Sep 07 forward-filled)
+    test       : 2014-09-10 to 2014-09-16  (7 days)
 
 Splits are chronologically contiguous (train -> val -> test, no overlap,
 no gap) to keep the scenario realistic (no data leakage from shuffling
@@ -76,9 +77,9 @@ H5_CHANNELS = {
 }
 
 SPLITS = [
-    {"name": "train",      "start": "2014-07-25 00:00:00", "end": "2014-08-23 23:59:54"},
-    {"name": "validation", "start": "2014-08-24 00:00:00", "end": "2014-08-30 23:59:54"},
-    {"name": "test",       "start": "2014-08-31 00:00:00", "end": "2014-09-06 23:59:54"},
+    {"name": "train",      "start": "2014-08-04 00:00:00", "end": "2014-09-02 23:59:54"},
+    {"name": "validation", "start": "2014-09-03 00:00:00", "end": "2014-09-09 23:59:54"},
+    {"name": "test",       "start": "2014-09-10 00:00:00", "end": "2014-09-16 23:59:54"},
 ]
 
 FREQ     = "6s"

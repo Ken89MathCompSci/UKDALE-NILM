@@ -7,9 +7,14 @@ Ported from combined_pinn_lnn_ukdale.py (root) with two changes:
 
 1. DATA SOURCE -- default --dataset-dir now points at APR-new-House5-dataset/
    instead of medium_dataset/:
-       APR-new-House5-dataset/UKDALE_HF_train.csv      (House 5, 2014-07-25 to 2014-08-23, 30 days)
-       APR-new-House5-dataset/UKDALE_HF_validation.csv (House 5, 2014-08-24 to 2014-08-30, 7 days)
-       APR-new-House5-dataset/UKDALE_HF_test.csv       (House 5, 2014-08-31 to 2014-09-06, 7 days)
+       APR-new-House5-dataset/UKDALE_HF_train.csv      (House 5, 2014-08-04 to 2014-09-02, 30 days)
+       APR-new-House5-dataset/UKDALE_HF_validation.csv (House 5, 2014-09-03 to 2014-09-09, 7 days)
+       APR-new-House5-dataset/UKDALE_HF_test.csv       (House 5, 2014-09-10 to 2014-09-16, 7 days)
+   Split selection rationale: Aug 04-Sep 02 train maximises microwave events
+   (31 vs 16 in the original Jul 25-Aug 23 window). Val spans the Sep 07
+   partial-day gap, handled by forward-fill (MAX_FILL=50 steps). Test week
+   Sep 10-16 has elevated washing_machine activity (11.3% ON) -- this is a
+   harder evaluation scenario that tests generalisation to heavy-usage days.
    No other change needed here -- the source script's APPLIANCES list
    ('dishwasher', 'fridge', 'microwave', 'washing_machine') already matches
    this dataset's column names exactly (unlike the Old-LNN_Algorithms scripts,
@@ -59,8 +64,10 @@ Joint training signal:
   - L_phys(gated_power)        physics acts on the final gated estimate
 
 Loss schedule:
-  Warmup (0 - WARMUP_EPOCHS-1):  MSE only
-  Full   (WARMUP_EPOCHS +):       MSE + lambda_phys * L_phys + lambda_event * L_event
+  Warmup (0 - WARMUP_EPOCHS-1):          MSE only  (lam=0)
+  Ramp   (WARMUP_EPOCHS - +RAMP_EPOCHS): MSE + lam*(lambda_phys*L_phys + lambda_event*L_event)
+                                          lam linearly 0->1 over RAMP_EPOCHS epochs
+  Full   (WARMUP_EPOCHS + RAMP_EPOCHS+): MSE + lambda_phys*L_phys + lambda_event*L_event (lam=1)
 
 WIN=299 (~30 min at 6s) was chosen in the source script to cover a full
 fridge compressor cycle; our own on-duration analysis of this dataset (see
@@ -107,12 +114,13 @@ LAMBDA_PHYS   = 0.01
 LAMBDA_EVENT  = 0.05
 EPSILON_W     = 50.0
 WARMUP_EPOCHS = 20
+RAMP_EPOCHS   = 10   # linear ramp of aux losses after warmup (matches House2-v2 Fix 3)
 
 THRESHOLD_DELTA   = 20.0
 THRESHOLD_LOW_PCT = 0.05
 THRESHOLD_MIN     = 10.0
 CYCLING_P5_W      = 80.0
-POS_WEIGHT_CLAMP  = (1.0, 50.0)
+POS_WEIGHT_CLAMP  = (1.0, 500.0)   # raised from 50 -- MW true imbalance ~1000:1
 
 APPLIANCES  = ['dishwasher', 'fridge', 'microwave', 'washing_machine']
 AGG_COL     = 'aggregate'
@@ -511,7 +519,8 @@ def train(data_dict: dict, save_dir: str,
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"\nModel parameters: {n_params:,}")
-    print(f"Warmup: MSE-only for {WARMUP_EPOCHS} epochs, then + physics + gate-event.\n")
+    print(f"Warmup: MSE-only for {WARMUP_EPOCHS} epochs, "
+          f"then linear ramp over {RAMP_EPOCHS} epochs, then full loss.\n")
 
     history = {k: [] for k in ['train_loss','train_mse','train_phys','train_event',
                                 'val_loss',  'val_mse',  'val_metrics']}
@@ -520,6 +529,17 @@ def train(data_dict: dict, save_dir: str,
     counter      = 0
 
     for epoch in range(EPOCHS):
+        # lambda ramp: 0 during warmup, linear 0->1 during ramp, 1 thereafter
+        if epoch < WARMUP_EPOCHS:
+            lam   = 0.0
+            phase = "WARMUP"
+        elif epoch < WARMUP_EPOCHS + RAMP_EPOCHS:
+            lam   = (epoch - WARMUP_EPOCHS + 1) / RAMP_EPOCHS
+            phase = f"RAMP({lam:.2f})"
+        else:
+            lam   = 1.0
+            phase = "FULL  "
+
         # -- Train --
         model.train()
         ep_tot = ep_mse = ep_phys = ep_ev = 0.0
@@ -531,8 +551,7 @@ def train(data_dict: dict, save_dir: str,
             l_mse  = mse_crit(gated_power, yb)
             l_phys = phys_crit(xb, gated_power)
             l_ev   = event_crit(gate_logits, yb)
-            loss   = l_mse if epoch < WARMUP_EPOCHS else (
-                     l_mse + lambda_phys * l_phys + lambda_event * l_ev)
+            loss   = l_mse + lam * (lambda_phys * l_phys + lambda_event * l_ev)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
@@ -574,8 +593,7 @@ def train(data_dict: dict, save_dir: str,
 
         avg_f1  = np.mean([vm[a]['f1']  for a in APPLIANCES])
         avg_mae = np.mean([vm[a]['mae'] for a in APPLIANCES])
-        status  = "WARMUP" if epoch < WARMUP_EPOCHS else "FULL  "
-        print(f"  [{status}] Epoch {epoch+1:3d}/{EPOCHS}  "
+        print(f"  [{phase}] Epoch {epoch+1:3d}/{EPOCHS}  "
               f"train={history['train_loss'][-1]:.5f} "
               f"(mse={history['train_mse'][-1]:.5f} phys={history['train_phys'][-1]:.5f} "
               f"ev={history['train_event'][-1]:.5f})  "
@@ -633,7 +651,7 @@ def train(data_dict: dict, save_dir: str,
     _plot_metrics(history, test_metrics, save_dir)
 
     cfg = {
-        'dataset': 'APR-new-House5-dataset (H5 train 2014-07-25..08-23 / val 08-24..08-30 / test 08-31..09-06)',
+        'dataset': 'APR-new-House5-dataset (H5 train 2014-08-04..09-02 / val 09-03..09-09 / test 09-10..09-16)',
         'model':   'CombinedPINNAdvancedLNN',
         'description': 'gated power = sigmoid(gate_logit) x sigmoid(power_logit)',
         'thresholds': {'train': tr_thr, 'val': va_thr, 'test': te_thr},
@@ -642,7 +660,8 @@ def train(data_dict: dict, save_dir: str,
         'model_params': {'in_ch': n_feat, 'hidden': hidden, 'n_apps': len(APPLIANCES), 'dt': dt},
         'train_params': {'lr': LR, 'epochs': EPOCHS, 'patience': PATIENCE,
                          'lambda_phys': lambda_phys, 'lambda_event': lambda_event,
-                         'epsilon_w': epsilon_w, 'warmup_epochs': WARMUP_EPOCHS},
+                         'epsilon_w': epsilon_w, 'warmup_epochs': WARMUP_EPOCHS,
+                         'ramp_epochs': RAMP_EPOCHS},
         'test_metrics': {app: {k: float(v) for k, v in m.items()}
                          for app, m in test_metrics.items()},
     }
@@ -665,10 +684,14 @@ def _plot_loss(history, save_dir):
              ('train_mse',  'val_mse',    'MSE Loss'),
              ('train_phys', None,         'Physics Loss (train)'),
              ('train_event',None,         'Gate-Event BCE (train)')]
+    n_ep = len(history['train_loss'])
     for ax, (tr_k, va_k, title) in zip(axes, pairs):
         ax.plot(ep, history[tr_k], label='Train', color='steelblue')
         if va_k:
             ax.plot(ep, history[va_k], label='Val', color='tomato')
+        ax.axvspan(1, min(WARMUP_EPOCHS, n_ep), alpha=0.05, color='gray', label='warmup')
+        ax.axvspan(WARMUP_EPOCHS + 1, min(WARMUP_EPOCHS + RAMP_EPOCHS, n_ep),
+                   alpha=0.08, color='orange', label='ramp')
         ax.set_title(title); ax.set_xlabel('Epoch')
         ax.legend(fontsize=8); ax.grid(alpha=0.3)
     plt.tight_layout()
