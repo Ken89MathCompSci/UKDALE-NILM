@@ -111,10 +111,10 @@ EMA_SPAN      = 10
 ROLL_K        = 10
 
 LAMBDA_PHYS   = 0.01
-LAMBDA_EVENT  = 0.05
+LAMBDA_EVENT  = 0.30   # raised from 0.05 -- House 5 MW imbalance ~463:1 needs stronger gate signal
 EPSILON_W     = 50.0
-WARMUP_EPOCHS = 20
-RAMP_EPOCHS   = 10   # linear ramp of aux losses after warmup (matches House2-v2 Fix 3)
+WARMUP_EPOCHS = 10     # reduced from 20 -- long warmup locks model into "always OFF" before gate trains
+RAMP_EPOCHS   = 10     # linear ramp of aux losses after warmup (matches House2-v2 Fix 3)
 
 THRESHOLD_DELTA   = 20.0
 THRESHOLD_LOW_PCT = 0.05
