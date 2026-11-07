@@ -11,11 +11,18 @@ Run each command in its own Colab cell from `/content/UKDALE-NILM` on branch
 %cd /content/UKDALE-NILM
 ```
 
+## Checkpoint rule (changed 7 November 2026)
+
+`run_ablation.py` now only keeps checkpoints from epochs where the physics and event losses
+are at full weight: epoch 21 for House 1, 30 for House 2, 20 for House 5. It also makes GPU
+runs repeatable (`cudnn.deterministic`). Earlier runs (1-November, 4-November) always kept
+an MSE-only warmup epoch, so all of them, including House 1 `full`, need rerunning.
+To reproduce the old behaviour, add `--select-from-epoch 0`.
+
 ## House 1
 
-`full` (seed 0) is already done: MAE 12.85, SAE 9.92, F1 0.696, P 0.616, R 0.825.
-
 ```
+!python APR-new-scripts/ablations/run_ablation.py --house 1 --variant full      --seeds 0
 !python APR-new-scripts/ablations/run_ablation.py --house 1 --variant no_phys   --seeds 0
 !python APR-new-scripts/ablations/run_ablation.py --house 1 --variant no_event  --seeds 0
 !python APR-new-scripts/ablations/run_ablation.py --house 1 --variant no_aux    --seeds 0
@@ -45,8 +52,9 @@ Run each command in its own Colab cell from `/content/UKDALE-NILM` on branch
 ## Notes
 
 - **Compare against the seed-0 `full` run of the same house,** not the paper's unseeded runs.
-- **Expect `no_phys`, `no_event` and `no_aux` to match `full` closely.** The best checkpoint
-  is selected during the MSE-only warmup, before those loss terms switch on.
+  The new `full` result replaces the AB-PILNN numbers in the paper.
+- **Check the header line of each run.** It should say `checkpoint from epoch 21` (House 1),
+  `30` (House 2) or `20` (House 5).
 - **Read results from the `MACRO h{house} {variant} seed=0 ...` line** at the end of each
   cell. Each run also saves `models/ablation_h{house}_{variant}_seed0_{timestamp}/ablation_summary.json`.
 - **Save outputs before the Colab session ends,** because `/content` is wiped.

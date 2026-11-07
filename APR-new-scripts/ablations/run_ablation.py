@@ -6,7 +6,15 @@ Loss-term and time-constant ablations of AB-PILNN for Houses 1, 2 and 5.
 Unlike ablation1-4 (standalone copies), this wrapper imports the exact script
 that produced each house's paper results and changes ONE thing, so every other
 setting (features, CNN, WIN=299, thresholds, pos_weight clamp, warmup/ramp,
-checkpoint-on-val-MSE) is guaranteed identical to the baseline:
+checkpoint-on-val-MSE) is guaranteed identical to the baseline.
+
+CHECKPOINT SELECTION: by default only epochs where the auxiliary losses are at
+full weight are eligible for checkpointing/early stopping (0-based epoch 20 for
+H1, 29 for H2, 19 for H5). The original scripts always picked a warmup (MSE-only)
+epoch, so lambda_phys/lambda_event never affected the saved model. Pass
+--select-from-epoch 0 to reproduce the original behaviour.
+
+Baselines:
 
     House 1: APR-new-scripts/combined_pinn_lnn_apr_new_house1_dataset.py
     House 2: APR-new-scripts-House2/combined_pinn_lnn_apr_new_house2_dataset_v2.py
@@ -90,6 +98,13 @@ def set_seed(seed: int):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark     = False
+
+
+def aux_fully_on_epoch(mod) -> int:
+    """First 0-based epoch with the auxiliary losses at full weight (H1 20, H2 29, H5 19)."""
+    return mod.WARMUP_EPOCHS + getattr(mod, 'RAMP_EPOCHS', 1) - 1
 
 
 def macro(test_metrics: dict) -> dict:
@@ -97,9 +112,12 @@ def macro(test_metrics: dict) -> dict:
     return {k: float(np.mean([m[k] for m in test_metrics.values()])) for k in keys}
 
 
-def run_one(house: int, variant: str, seed: int, dataset_dir: str = None) -> dict:
+def run_one(house: int, variant: str, seed: int, dataset_dir: str = None,
+            select_from_epoch: int = None) -> dict:
     mod = load_baseline(house)   # fresh module each run, so patches never leak
     set_seed(seed)
+    if select_from_epoch is None:
+        select_from_epoch = aux_fully_on_epoch(mod)
 
     lambda_phys, lambda_event = mod.LAMBDA_PHYS, mod.LAMBDA_EVENT
     if variant in ('no_phys', 'no_aux'):
@@ -112,7 +130,8 @@ def run_one(house: int, variant: str, seed: int, dataset_dir: str = None) -> dic
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     save_dir  = os.path.join(ROOT, 'models', f'ablation_h{house}_{variant}_seed{seed}_{timestamp}')
     print(f"\n{'=' * 85}\nHouse {house} | variant={variant} | seed={seed} | "
-          f"lambda_phys={lambda_phys} lambda_event={lambda_event}\n{'=' * 85}")
+          f"lambda_phys={lambda_phys} lambda_event={lambda_event} | "
+          f"checkpoint from epoch {select_from_epoch + 1}\n{'=' * 85}")
 
     data_dict = mod.load_data(dataset_dir or mod.DEFAULT_DATASET_DIR)
     test_metrics, _ = mod.train(data_dict, save_dir,
@@ -120,10 +139,12 @@ def run_one(house: int, variant: str, seed: int, dataset_dir: str = None) -> dic
                                 dt           = 0.1,
                                 lambda_phys  = lambda_phys,
                                 lambda_event = lambda_event,
-                                epsilon_w    = mod.EPSILON_W)
+                                epsilon_w    = mod.EPSILON_W,
+                                select_from_epoch = select_from_epoch)
 
     summary = {'house': house, 'variant': variant, 'seed': seed,
                'lambda_phys': lambda_phys, 'lambda_event': lambda_event,
+               'select_from_epoch': select_from_epoch,
                'baseline_script': os.path.relpath(BASELINES[house], ROOT),
                'macro': macro(test_metrics),
                'test_metrics': {a: {k: float(v) for k, v in m.items()} for a, m in test_metrics.items()}}
@@ -145,10 +166,14 @@ if __name__ == '__main__':
     parser.add_argument('--variant',     default='all', choices=VARIANTS + ['all'])
     parser.add_argument('--seeds',       type=int, nargs='+', default=[0, 1, 2])
     parser.add_argument('--dataset-dir', default=None)
+    parser.add_argument('--select-from-epoch', type=int, default=None,
+                        help='0-based first epoch eligible for checkpointing; default = epoch the '
+                             'aux losses reach full weight; 0 = original (warmup-inclusive) behaviour')
     args = parser.parse_args()
 
     variants = VARIANTS if args.variant == 'all' else [args.variant]
-    results  = [run_one(args.house, v, s, args.dataset_dir) for v in variants for s in args.seeds]
+    results  = [run_one(args.house, v, s, args.dataset_dir, args.select_from_epoch)
+                for v in variants for s in args.seeds]
 
     print(f"\n{'=' * 85}\nSUMMARY  House {args.house}  (mean +/- std over seeds {args.seeds})\n{'=' * 85}")
     print(f"{'Variant':<10} {'MAE':>14} {'SAE':>14} {'F1':>14} {'Prec':>14} {'Rec':>14}")

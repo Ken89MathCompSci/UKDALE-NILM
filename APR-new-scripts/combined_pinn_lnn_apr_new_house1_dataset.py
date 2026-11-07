@@ -432,7 +432,8 @@ def train(data_dict: dict, save_dir: str,
           hidden: int = 64, dt: float = 0.1,
           lambda_phys: float = LAMBDA_PHYS,
           lambda_event: float = LAMBDA_EVENT,
-          epsilon_w: float = EPSILON_W) -> tuple:
+          epsilon_w: float = EPSILON_W,
+          select_from_epoch: int = 0) -> tuple:
 
     os.makedirs(save_dir, exist_ok=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -590,15 +591,17 @@ def train(data_dict: dict, save_dir: str,
                   f"R={m['recall']:.4f}  MAE={m['mae']:.2f}  SAE={m['sae']:.4f}  "
                   f"TP={m['tp']:,d}  TN={m['tn']:,d}  FP={m['fp']:,d}  FN={m['fn']:,d}")
 
-        if avg_va_mse < best_val_mse:
-            best_val_mse = avg_va_mse
-            best_state   = {k: v.clone() for k, v in model.state_dict().items()}
-            counter      = 0
-        else:
-            counter += 1
-            if counter >= PATIENCE:
-                print(f"\n  Early stopping at epoch {epoch+1}")
-                break
+        # Checkpoint/early-stop only once epoch >= select_from_epoch (0 = original behaviour)
+        if epoch >= select_from_epoch:
+            if avg_va_mse < best_val_mse:
+                best_val_mse = avg_va_mse
+                best_state   = {k: v.clone() for k, v in model.state_dict().items()}
+                counter      = 0
+            else:
+                counter += 1
+                if counter >= PATIENCE:
+                    print(f"\n  Early stopping at epoch {epoch+1}")
+                    break
 
     print("\nTraining complete.")
 
@@ -645,7 +648,7 @@ def train(data_dict: dict, save_dir: str,
         'model_params': {'in_ch': n_feat, 'hidden': hidden, 'n_apps': len(APPLIANCES), 'dt': dt},
         'train_params': {'lr': LR, 'epochs': EPOCHS, 'patience': PATIENCE,
                          'lambda_phys': lambda_phys, 'lambda_event': lambda_event,
-                         'epsilon_w': epsilon_w, 'warmup_epochs': WARMUP_EPOCHS},
+                         'epsilon_w': epsilon_w, 'select_from_epoch': select_from_epoch, 'warmup_epochs': WARMUP_EPOCHS},
         'test_metrics': {app: {k: float(v) for k, v in m.items()}
                          for app, m in test_metrics.items()},
     }
