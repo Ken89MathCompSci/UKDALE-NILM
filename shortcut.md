@@ -58,3 +58,19 @@ To reproduce the old behaviour, add `--select-from-epoch 0`.
 - **Read results from the `MACRO h{house} {variant} seed=0 ...` line** at the end of each
   cell. Each run also saves `models/ablation_h{house}_{variant}_seed0_{timestamp}/ablation_summary.json`.
 - **Save outputs before the Colab session ends,** because `/content` is wiped.
+
+## Loss-weight rebalancing (House 1)
+
+At the default weights the event loss is about 1,000x the MSE term (and physics about
+100x), which costs about 4.5 W of MAE. These runs test smaller weights. Compare each
+against `no_aux` (MAE 12.36, F1 0.747) and choose using the validation numbers in the log,
+not the test numbers.
+
+```
+!python APR-new-scripts/ablations/run_ablation.py --house 1 --variant full --seeds 0 --lambda-event 0.0005 --lambda-phys 0.0001
+!python APR-new-scripts/ablations/run_ablation.py --house 1 --variant full --seeds 0 --lambda-event 0.005  --lambda-phys 0.001
+!python APR-new-scripts/ablations/run_ablation.py --house 1 --variant full --seeds 0 --lambda-event 0.0005 --lambda-phys 0
+```
+
+The header line and the `MACRO` line show the weights used (`lp=...  le=...`), and the
+run folder name includes them (for example `ablation_h1_full_lp0.0001_le0.0005_seed0_...`).

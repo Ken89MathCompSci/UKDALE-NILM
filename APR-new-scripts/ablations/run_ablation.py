@@ -113,13 +113,20 @@ def macro(test_metrics: dict) -> dict:
 
 
 def run_one(house: int, variant: str, seed: int, dataset_dir: str = None,
-            select_from_epoch: int = None) -> dict:
+            select_from_epoch: int = None,
+            lambda_phys: float = None, lambda_event: float = None) -> dict:
     mod = load_baseline(house)   # fresh module each run, so patches never leak
     set_seed(seed)
     if select_from_epoch is None:
         select_from_epoch = aux_fully_on_epoch(mod)
 
-    lambda_phys, lambda_event = mod.LAMBDA_PHYS, mod.LAMBDA_EVENT
+    # Overrides replace the house default; the variant may still zero them below.
+    tag = ''
+    if lambda_phys is not None or lambda_event is not None:
+        tag = f'_lp{lambda_phys if lambda_phys is not None else mod.LAMBDA_PHYS:g}' \
+              f'_le{lambda_event if lambda_event is not None else mod.LAMBDA_EVENT:g}'
+    lambda_phys  = mod.LAMBDA_PHYS  if lambda_phys  is None else lambda_phys
+    lambda_event = mod.LAMBDA_EVENT if lambda_event is None else lambda_event
     if variant in ('no_phys', 'no_aux'):
         lambda_phys = 0.0
     if variant in ('no_event', 'no_aux'):
@@ -128,7 +135,7 @@ def run_one(house: int, variant: str, seed: int, dataset_dir: str = None,
         mod.LiquidCell = FixedTauLiquidCell   # model class looks it up at construction
 
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    save_dir  = os.path.join(ROOT, 'models', f'ablation_h{house}_{variant}_seed{seed}_{timestamp}')
+    save_dir  = os.path.join(ROOT, 'models', f'ablation_h{house}_{variant}{tag}_seed{seed}_{timestamp}')
     print(f"\n{'=' * 85}\nHouse {house} | variant={variant} | seed={seed} | "
           f"lambda_phys={lambda_phys} lambda_event={lambda_event} | "
           f"checkpoint from epoch {select_from_epoch + 1}\n{'=' * 85}")
@@ -151,7 +158,7 @@ def run_one(house: int, variant: str, seed: int, dataset_dir: str = None,
     with open(os.path.join(save_dir, 'ablation_summary.json'), 'w') as f:
         json.dump(summary, f, indent=4)
     m = summary['macro']
-    print(f"\nMACRO h{house} {variant:<9} seed={seed}  MAE={m['mae']:.2f}  SAE={m['sae']:.2f}  "
+    print(f"\nMACRO h{house} {variant:<9} seed={seed}  lp={lambda_phys:g} le={lambda_event:g}  MAE={m['mae']:.2f}  SAE={m['sae']:.2f}  "
           f"F1={m['f1']:.4f}  P={m['precision']:.4f}  R={m['recall']:.4f}")
     return summary
 
@@ -169,10 +176,15 @@ if __name__ == '__main__':
     parser.add_argument('--select-from-epoch', type=int, default=None,
                         help='0-based first epoch eligible for checkpointing; default = epoch the '
                              'aux losses reach full weight; 0 = original (warmup-inclusive) behaviour')
+    parser.add_argument('--lambda-phys',  type=float, default=None,
+                        help='override the house default lambda_phys (no_phys/no_aux still set it to 0)')
+    parser.add_argument('--lambda-event', type=float, default=None,
+                        help='override the house default lambda_event (no_event/no_aux still set it to 0)')
     args = parser.parse_args()
 
     variants = VARIANTS if args.variant == 'all' else [args.variant]
-    results  = [run_one(args.house, v, s, args.dataset_dir, args.select_from_epoch)
+    results  = [run_one(args.house, v, s, args.dataset_dir, args.select_from_epoch,
+                        args.lambda_phys, args.lambda_event)
                 for v in variants for s in args.seeds]
 
     print(f"\n{'=' * 85}\nSUMMARY  House {args.house}  (mean +/- std over seeds {args.seeds})\n{'=' * 85}")
